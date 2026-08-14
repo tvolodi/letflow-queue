@@ -1,0 +1,12 @@
+services:
+  app:
+    image: letflow-queue-test:latest
+    env_file: .env
+    volumes:
+      - letflow_queue_test_data:/app/data
+    ports:
+      - "127.0.0.1:3112:4000"
+    restart: unless-stopped
+
+volumes:
+  letflow_queue_test_data:

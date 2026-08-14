@@ -1,0 +1,12 @@
+services:
+  app:
+    image: letflow-queue-prod:latest
+    env_file: .env
+    volumes:
+      - letflow_queue_prod_data:/app/data
+    ports:
+      - "127.0.0.1:3102:4000"
+    restart: unless-stopped
+
+volumes:
+  letflow_queue_prod_data:
