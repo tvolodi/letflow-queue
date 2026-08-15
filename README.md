@@ -292,13 +292,19 @@ on every push to `master`, once `.github/workflows/ci.yml` passes, a job
 SSHes into `hetzner-prod` and runs `deploy/redeploy-test.sh`.
 
 The SSH key used (`HETZNER_DEPLOY_SSH_KEY`, a GitHub Actions secret on this
-repo) is deliberately narrow: its `authorized_keys` entry on the host is
-restricted via a `command=` forced-command option to run *only*
-`deploy/redeploy-test.sh` — it cannot open an interactive shell or run any
-other command, even if the secret leaked. See `ai-dala-infra`'s
-`T-0111-provision-letflow-queue-cd-deploy-key.md` for how the key was
-provisioned. This repo's own agents/CI cannot create or rotate that key —
-it's generated on the host and handed to a human to add as a secret here.
+repo, alongside `HETZNER_DEPLOY_HOST`/`HETZNER_DEPLOY_USER`) is deliberately
+narrow: its `authorized_keys` entry on the host is restricted via a
+`command=` forced-command option (`sudo bash .../redeploy-test.sh`) plus
+`restrict` to run *only* that one script — it cannot open an interactive
+shell or run any other command, even if the secret leaked. Verified live at
+provisioning time: both an unrelated command and a deliberately destructive
+one (`rm -rf` the app directory), sent over the key, ran the forced redeploy
+script instead of the requested command. See `ai-dala-infra`'s
+`T-0111-provision-letflow-queue-cd-deploy-key.md` and
+`landscape/hosts/hetzner-prod.md`'s "Inbound CD deploy keys" section for the
+full detail. This repo's own agents/CI cannot create or rotate that key —
+it's generated on the host and handed to a human (or, per `T-0111`, set
+directly via `gh secret set` once generated) to add as a secret here.
 
 There is no CD for **prod** — `queue.ai-dala.com` isn't deployed yet, and
 when it is, promotion to prod should stay a deliberate, separately-triggered
