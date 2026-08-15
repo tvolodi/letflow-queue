@@ -24,4 +24,3 @@ jobs:
           # Any script passed here is ignored by sshd in favor of the forced
           # command; it's included anyway for clarity/documentation.
           script: bash /opt/apps/letflow-queue-test/deploy/redeploy-test.sh
-          script_stop: true
