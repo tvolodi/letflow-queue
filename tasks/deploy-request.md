@@ -2,7 +2,7 @@
 app: letflow-queue
 ref: master (ba9f1e0)
 env: test
-ready: true
+ready: false
 notes: >
   Initial deploy. Small Elixir/Phoenix + SQLite service, 4 endpoints
   (register_task, get_next_task, set_lock, release_lock) for multi-host
