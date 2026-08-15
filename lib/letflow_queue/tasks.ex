@@ -14,7 +14,10 @@ defmodule LetflowQueue.Tasks do
 
   import Ecto.Query, warn: false
 
+  require Logger
+
   alias Ecto.Multi
+  alias LetflowQueue.GitHub
   alias LetflowQueue.Repo
   alias LetflowQueue.Tasks.Task
 
@@ -24,27 +27,81 @@ defmodule LetflowQueue.Tasks do
   Creates a new task with an auto-incrementing `impl_order` (== `id`).
   Status starts as `"open"`.
 
+  Also creates a corresponding GitHub Issue on the configured repo
+  (`GITHUB_REPO`) as **best-effort** sync: title = task title, body = task
+  description + acceptance criteria. If GitHub isn't configured or the API
+  call fails for any reason, this is logged and `register_task/1` still
+  succeeds — the local task is always created regardless of GitHub's
+  availability, with `github_issue_number: nil` in that case.
+
   Returns `{:ok, task}` or `{:error, changeset}`.
   """
   @spec register_task(map()) :: {:ok, Task.t()} | {:error, Ecto.Changeset.t()}
   def register_task(attrs) when is_map(attrs) do
-    %Task{}
-    |> Task.create_changeset(attrs)
-    |> Repo.insert()
+    with {:ok, task} <- %Task{} |> Task.create_changeset(attrs) |> Repo.insert() do
+      {:ok, maybe_create_github_issue(task)}
+    end
+  end
+
+  defp maybe_create_github_issue(task) do
+    case GitHub.create_issue(task.title, issue_body(task)) do
+      {:ok, issue_number} ->
+        task
+        |> Task.github_issue_changeset(issue_number)
+        |> Repo.update()
+        |> case do
+          {:ok, updated} ->
+            updated
+
+          {:error, changeset} ->
+            Logger.warning(
+              "letflow-queue: created GitHub issue ##{issue_number} for task #{task.id} " <>
+                "but failed to persist github_issue_number: #{inspect(changeset.errors)}"
+            )
+
+            task
+        end
+
+      {:error, reason} ->
+        Logger.warning(
+          "letflow-queue: GitHub issue creation failed for task #{task.id} (#{inspect(reason)}); " <>
+            "continuing without GitHub sync"
+        )
+
+        task
+    end
+  end
+
+  defp issue_body(task) do
+    criteria =
+      task.acceptance_criteria
+      |> Enum.map(&"- #{&1}")
+      |> Enum.join("\n")
+
+    """
+    #{task.description}
+
+    Acceptance criteria:
+    #{criteria}
+    """
   end
 
   @doc """
-  Atomically finds and claims the lowest-`impl_order` task that is
+  First imports any open GitHub Issues not yet tracked locally as new
+  `"open"` tasks (best-effort — skipped entirely if GitHub isn't
+  configured or the API call fails, never blocking the claim below), then
+  atomically finds and claims the lowest-`impl_order` task that is
   `status = "open"`, unlocked, and whose every `depends_on` id is
-  `status = "done"` — then sets `locked_by`/`locked_at` for it, all in a
-  single SQL statement so two concurrent callers can never claim the same
-  row.
+  `status = "done"` — setting `locked_by`/`locked_at` for it in a single
+  SQL statement so two concurrent callers can never claim the same row.
 
   Returns `{:ok, task}` on success, or `{:error, :no_eligible_task}` if
   nothing is currently claimable.
   """
   @spec get_next_task(String.t()) :: {:ok, Task.t()} | {:error, :no_eligible_task}
   def get_next_task(agent_id) when is_binary(agent_id) and agent_id != "" do
+    import_open_github_issues()
+
     now = DateTime.utc_now() |> DateTime.truncate(:second)
 
     # The eligibility predicate (open, unlocked, all dependencies done) is
@@ -72,7 +129,8 @@ defmodule LetflowQueue.Tasks do
       LIMIT 1
     )
     RETURNING id, title, description, acceptance_criteria, depends_on,
-      stage, status, locked_by, locked_at, inserted_at, updated_at
+      stage, status, locked_by, locked_at, github_issue_number, body,
+      inserted_at, updated_at
     """
 
     case Repo.transaction(fn ->
@@ -89,6 +147,45 @@ defmodule LetflowQueue.Tasks do
     end
   end
 
+  # Best-effort import step run before the atomic claim query. Never raises
+  # and never affects the claim below: a GitHub failure here just means the
+  # import is skipped for this call, and the existing claim query proceeds
+  # exactly as it did before this feature existed.
+  defp import_open_github_issues do
+    case GitHub.list_open_issues() do
+      {:ok, issues} ->
+        Enum.each(issues, &import_github_issue/1)
+
+      {:error, reason} ->
+        Logger.warning(
+          "letflow-queue: GitHub issue import failed (#{inspect(reason)}); " <>
+            "proceeding without import for this call"
+        )
+    end
+  end
+
+  defp import_github_issue(%{number: number, title: title, body: body}) do
+    if Repo.exists?(from t in Task, where: t.github_issue_number == ^number) do
+      :ok
+    else
+      attrs = %{"title" => title, "body" => body, "github_issue_number" => number}
+
+      %Task{}
+      |> Task.github_import_changeset(attrs)
+      |> Repo.insert()
+      |> case do
+        {:ok, _task} ->
+          :ok
+
+        {:error, changeset} ->
+          Logger.warning(
+            "letflow-queue: failed to import GitHub issue ##{number} as a task: " <>
+              inspect(changeset.errors)
+          )
+      end
+    end
+  end
+
   # The column order returned by the hand-written RETURNING clause above —
   # kept explicit (rather than trusting driver-reported column metadata,
   # which exqlite doesn't populate for UPDATE ... RETURNING) so the
@@ -96,7 +193,7 @@ defmodule LetflowQueue.Tasks do
   # run through the schema's Ecto.Type loaders (decoding the JSON text
   # columns).
   @returning_columns ~w(id title description acceptance_criteria depends_on
-    stage status locked_by locked_at inserted_at updated_at)
+    stage status locked_by locked_at github_issue_number body inserted_at updated_at)
 
   defp load_task(row) when is_list(row) do
     @returning_columns
@@ -196,9 +293,34 @@ defmodule LetflowQueue.Tasks do
           task
           |> Ecto.Changeset.change(changes)
           |> Repo.update()
+          |> tap_maybe_close_github_issue(status)
         else
           {:error, :locked_by_other}
         end
     end
   end
+
+  # Best-effort: closes the linked GitHub issue (if any) when a release
+  # transitions the task to "done". Never affects the release's own
+  # result — a GitHub failure here is logged and swallowed.
+  defp tap_maybe_close_github_issue(
+         {:ok, %Task{status: "done", github_issue_number: n} = task},
+         "done"
+       )
+       when is_integer(n) do
+    case GitHub.close_issue(n) do
+      {:ok, :closed} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "letflow-queue: failed to close GitHub issue ##{n} for task #{task.id} " <>
+            "(#{inspect(reason)}); local status transition already committed"
+        )
+    end
+
+    {:ok, task}
+  end
+
+  defp tap_maybe_close_github_issue(result, _status), do: result
 end

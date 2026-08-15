@@ -34,11 +34,47 @@ Every task row: `id` (= `impl_order`, autoincrement primary key),
 `depends_on` (JSON list of other task ids), `stage` (free-form string,
 purely informational — mirrors Letflow's S0–S8 stage tags with no
 validation), `status` (`"open"` | `"done"` | `"blocked"`), `locked_by`,
-`locked_at`, `inserted_at`/`updated_at`.
+`locked_at`, `github_issue_number` (nullable — see "GitHub Issues sync"
+below), `body` (nullable — full verbatim GitHub issue text, only set for
+tasks imported from GitHub), `inserted_at`/`updated_at`.
 
 `impl_order` and `id` are always the same integer. The field is exposed
 under both names in every JSON response so callers don't have to know
 that "id" doubles as the queue's implementation order.
+
+## GitHub Issues sync
+
+The four operations above remain the only *control* surface — agents
+never read or write GitHub Issues to drive the queue. Separately, this
+service optionally mirrors queue state into GitHub's own UI for human
+visibility, in both directions:
+
+1. **`register_task` → GitHub.** Every call to `register_task` also
+   creates a GitHub Issue on the configured repo: title = task title,
+   body = task description + acceptance criteria. The returned issue
+   number is stored on the task row as `github_issue_number`.
+2. **GitHub → `get_next_task`.** Every call to `get_next_task` first
+   pulls the repo's open issues and imports any not already tracked
+   (matched by `github_issue_number`) as new local tasks — title = issue
+   title, `body` = the full issue body verbatim (not parsed),
+   `acceptance_criteria` = `["See linked GitHub issue for full description"]`
+   (a raw issue body doesn't map onto a structured criteria list),
+   `depends_on = []` (GitHub-originated tasks have no way to express
+   queue-native dependencies — a known, accepted limitation), `stage =
+   nil`. This import runs *before* the existing atomic-claim query, so an
+   imported issue can be claimed in the same call that imported it.
+3. **`release_lock` → GitHub.** Releasing a task's lock with
+   `status: "done"` closes the linked GitHub Issue, if the task has a
+   non-nil `github_issue_number`.
+
+**All three directions are best-effort.** GitHub sync requires two
+environment variables — `GITHUB_TOKEN` (a personal access token) and
+`GITHUB_REPO` (e.g. `tvolodi/letflow`). If either is unset, or the
+GitHub API call fails for any reason (network error, rate limit, bad
+token), the sync step is skipped and logged
+(`Logger.warning/1`) — it never blocks, fails, or changes the result of
+the underlying queue operation. The service works fully without any
+GitHub configuration at all; you only lose the GitHub-side visibility.
 
 ## Auth
 
@@ -192,6 +228,12 @@ The dev config (`config/dev.exs`) has a hardcoded fallback auth token
 Override it with the real env var if you want to test the boot-time
 read path.
 
+GitHub sync is entirely optional locally too: set `GITHUB_TOKEN` (a
+personal access token) and `GITHUB_REPO` (e.g. `tvolodi/letflow`) as
+environment variables before starting the server if you want to exercise
+it against the real GitHub API; leave them unset and every sync step
+silently no-ops.
+
 ## Running tests
 
 ```bash
@@ -205,6 +247,13 @@ concurrency test that spawns two (and, separately, ten) simultaneous
 exactly one receives it. There's also an HTTP-level test suite in
 `test/letflow_queue_web/controllers/task_controller_test.exs` covering
 auth, status codes, and the response envelope.
+
+`test/letflow_queue/github_sync_test.exs` covers the GitHub Issues sync
+behavior described above, against `LetflowQueue.GitHub.FakeClient`
+(`test/support/github/fake_client.ex`) — an in-memory fake standing in for
+`LetflowQueue.GitHub.ReqClient`, configured via
+`config :letflow_queue, github_client: ...` in `config/test.exs`. No test
+in this suite makes a real network call to GitHub.
 
 ## Deploying
 

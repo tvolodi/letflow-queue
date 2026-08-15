@@ -23,6 +23,19 @@ end
 config :letflow_queue, LetflowQueueWeb.Endpoint,
   http: [port: String.to_integer(System.get_env("PORT", "4000"))]
 
+# Optional GitHub Issues sync (see README.md "GitHub Issues sync"). Both
+# are read here, at boot, exactly like QUEUE_AUTH_TOKEN below — never
+# hardcoded. Unlike QUEUE_AUTH_TOKEN, neither is required: sync is
+# best-effort and LetflowQueue.GitHub treats either being unset/blank as
+# "not configured", degrading every sync call to a no-op rather than
+# raising. Applied in every env (not just :prod) since config/dev.exs and
+# config/test.exs intentionally have no fallback for these — unlike the
+# dev auth token, there is no meaningful dev/test default for a real
+# external GitHub repo to sync against.
+config :letflow_queue,
+  github_token: System.get_env("GITHUB_TOKEN"),
+  github_repo: System.get_env("GITHUB_REPO")
+
 if config_env() == :prod do
   # The single shared bearer token every one of the four endpoints checks
   # (except GET /health). Read here, at boot, from the environment —

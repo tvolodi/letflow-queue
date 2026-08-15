@@ -26,6 +26,14 @@ defmodule LetflowQueue.Tasks.Task do
     field :status, :string, default: "open"
     field :locked_by, :string
     field :locked_at, :utc_datetime
+    # Non-nil when this task has a linked GitHub Issue — either created by
+    # register_task/1 (best-effort) or imported from GitHub by
+    # get_next_task/1. See LetflowQueue.GitHub.
+    field :github_issue_number, :integer
+    # Full verbatim GitHub issue body. Only populated for tasks imported
+    # from GitHub; register_task/1-created tasks leave this nil (they
+    # already have `description`).
+    field :body, :string
 
     timestamps(type: :utc_datetime)
   end
@@ -60,6 +68,32 @@ defmodule LetflowQueue.Tasks.Task do
     end
   end
 
+  @doc """
+  Changeset for importing a task from an open GitHub Issue
+  (`get_next_task/1`'s best-effort import step). `acceptance_criteria` is a
+  fixed placeholder (a raw issue body doesn't map to a criteria list) and
+  `depends_on` is always empty (GitHub-originated tasks have no way to
+  express queue-native dependencies). `description` is a required NOT NULL
+  column at the DB level but isn't meaningful for a GitHub-imported task
+  (the verbatim issue text lives in `body` instead), so it's set to an
+  empty string here rather than left unset.
+  """
+  def github_import_changeset(task, attrs) do
+    task
+    |> cast(attrs, [:title, :body, :github_issue_number])
+    |> validate_required([:title, :github_issue_number])
+    |> put_change(:description, "")
+    |> put_change(:acceptance_criteria, ["See linked GitHub issue for full description"])
+    |> put_change(:depends_on, [])
+    |> put_change(:stage, nil)
+    |> unique_constraint(:github_issue_number)
+  end
+
+  @doc "Changeset for attaching a GitHub issue number to an existing task."
+  def github_issue_changeset(task, github_issue_number) do
+    change(task, github_issue_number: github_issue_number)
+  end
+
   @doc false
   def statuses, do: @statuses
 
@@ -79,6 +113,8 @@ defmodule LetflowQueue.Tasks.Task do
       status: task.status,
       locked_by: task.locked_by,
       locked_at: task.locked_at,
+      github_issue_number: task.github_issue_number,
+      body: task.body,
       inserted_at: task.inserted_at,
       updated_at: task.updated_at
     }

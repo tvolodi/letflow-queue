@@ -14,6 +14,11 @@ config :letflow_queue, LetflowQueue.Repo,
 # depending on the environment.
 config :letflow_queue, auth_token: "test-secret-token"
 
+# Swap the real Req-backed GitHub client for a test-only fake so the suite
+# never makes real network calls. Individual tests configure the fake's
+# behavior (success/failure/issue list) via Application.put_env in setup.
+config :letflow_queue, github_client: LetflowQueue.GitHub.FakeClient
+
 # We don't run a server during test. If one is required,
 # you can enable the server option below.
 config :letflow_queue, LetflowQueueWeb.Endpoint,
