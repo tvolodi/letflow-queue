@@ -1,0 +1,27 @@
+name: CD
+
+# Runs only after CI succeeds on master — never deploys code that hasn't passed
+# mix format/compile/test. See workflows/ci.yml for the tested job.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    branches: [master]
+    types: [completed]
+
+jobs:
+  deploy:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to hetzner-prod test environment
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.HETZNER_DEPLOY_HOST }}
+          username: ${{ secrets.HETZNER_DEPLOY_USER }}
+          key: ${{ secrets.HETZNER_DEPLOY_SSH_KEY }}
+          # The deploy key's authorized_keys entry is restricted (command=) to
+          # invoke deploy/redeploy-test.sh only — see ai-dala-infra's T-0111.
+          # Any script passed here is ignored by sshd in favor of the forced
+          # command; it's included anyway for clarity/documentation.
+          script: bash /opt/apps/letflow-queue-test/deploy/redeploy-test.sh
+          script_stop: true

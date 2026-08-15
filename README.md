@@ -266,12 +266,15 @@ See `deploy/`:
 - `deploy/docker-compose.test.yml` / `docker-compose.prod.yml` —
   single-service compose files. `env_file: .env` is resolved relative
   to `deploy/` — copy `deploy/.env.example` to `deploy/.env` and fill
-  in real values first. Host ports `127.0.0.1:3120` (test) and
+  in real values first. Host ports `127.0.0.1:3112` (test) and
   `127.0.0.1:3102` (prod) only — this is an internal coordination
   service; nginx fronts it.
 - `deploy/nginx/letflow-queue-test.conf` / `letflow-queue.conf` — nginx
   vhost snippets for `queue-test.ai-dala.com` / `queue.ai-dala.com`,
   proxying to the host ports above.
+- `deploy/redeploy-test.sh` — git pull + rebuild + force-recreate +
+  health-check-with-retry, run on the host. Used both for manual
+  redeploys and by CD (below).
 
 Host ports: `127.0.0.1:3112` (test) and `127.0.0.1:3102` (prod) — the
 next free slots in `ai-dala-infra`'s declared `3110-3119` (test) and
@@ -281,3 +284,23 @@ next free slots in `ai-dala-infra`'s declared `3110-3119` (test) and
 the live port registry before actually deploying, since that file can
 drift — `ai-dala-infra`'s own setup task for this service
 (`T-0107-setup-letflow-queue-deploy-infra`) carries the same reminder.
+
+## Continuous deployment
+
+`.github/workflows/cd.yml` redeploys the **test** environment automatically:
+on every push to `master`, once `.github/workflows/ci.yml` passes, a job
+SSHes into `hetzner-prod` and runs `deploy/redeploy-test.sh`.
+
+The SSH key used (`HETZNER_DEPLOY_SSH_KEY`, a GitHub Actions secret on this
+repo) is deliberately narrow: its `authorized_keys` entry on the host is
+restricted via a `command=` forced-command option to run *only*
+`deploy/redeploy-test.sh` — it cannot open an interactive shell or run any
+other command, even if the secret leaked. See `ai-dala-infra`'s
+`T-0111-provision-letflow-queue-cd-deploy-key.md` for how the key was
+provisioned. This repo's own agents/CI cannot create or rotate that key —
+it's generated on the host and handed to a human to add as a secret here.
+
+There is no CD for **prod** — `queue.ai-dala.com` isn't deployed yet, and
+when it is, promotion to prod should stay a deliberate, separately-triggered
+step (e.g. a tag push or manual workflow dispatch), not another effect of
+pushing to `master`.
