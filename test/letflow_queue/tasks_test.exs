@@ -6,8 +6,11 @@ defmodule LetflowQueue.TasksTest do
   @valid_attrs %{
     "title" => "Do the thing",
     "description" => "A thing that needs doing",
-    "acceptance_criteria" => ["criterion one", "criterion two"]
+    "acceptance_criteria" => ["criterion one", "criterion two"],
+    "task_type" => "requirement"
   }
+
+  @issue_attrs Map.put(@valid_attrs, "task_type", "issue")
 
   describe "register_task/1" do
     test "creates a task with impl_order equal to id, status open" do
@@ -21,6 +24,7 @@ defmodule LetflowQueue.TasksTest do
       assert task.status == "open"
       assert task.locked_by == nil
       assert task.stage == nil
+      assert task.task_type == "requirement"
     end
 
     test "impl_order mirrors id in the JSON-facing map" do
@@ -51,12 +55,13 @@ defmodule LetflowQueue.TasksTest do
       assert t2.stage == "S2"
     end
 
-    test "requires title, description, and at least one acceptance criterion" do
+    test "requires title, description, acceptance_criteria, and task_type" do
       assert {:error, changeset} = Tasks.register_task(%{})
       errors = errors_on(changeset)
       assert "can't be blank" in errors.title
       assert "can't be blank" in errors.description
       assert "can't be blank" in errors.acceptance_criteria
+      assert "can't be blank" in errors.task_type
     end
 
     test "rejects an empty acceptance_criteria list" do
@@ -64,6 +69,13 @@ defmodule LetflowQueue.TasksTest do
                Tasks.register_task(Map.put(@valid_attrs, "acceptance_criteria", []))
 
       assert "should have at least 1 item(s)" in errors_on(changeset).acceptance_criteria
+    end
+
+    test "rejects a task_type outside requirement/issue" do
+      assert {:error, changeset} =
+               Tasks.register_task(Map.put(@valid_attrs, "task_type", "bogus"))
+
+      assert "is invalid" in errors_on(changeset).task_type
     end
   end
 
@@ -193,6 +205,50 @@ defmodule LetflowQueue.TasksTest do
       assert length(successes) == 1
       {:ok, claimed} = List.first(successes)
       assert claimed.id == task.id
+    end
+  end
+
+  describe "get_next_task/1 issue-vs-requirement priority" do
+    test "an eligible issue is claimed ahead of an older eligible requirement" do
+      assert {:ok, _req} = Tasks.register_task(@valid_attrs)
+      assert {:ok, issue} = Tasks.register_task(@issue_attrs)
+
+      assert {:ok, claimed} = Tasks.get_next_task("agent-1")
+      assert claimed.id == issue.id
+      assert claimed.task_type == "issue"
+    end
+
+    test "among multiple eligible issues, the newest (highest id) is claimed first" do
+      assert {:ok, _issue1} = Tasks.register_task(@issue_attrs)
+      assert {:ok, issue2} = Tasks.register_task(@issue_attrs)
+
+      assert {:ok, claimed} = Tasks.get_next_task("agent-1")
+      assert claimed.id == issue2.id
+    end
+
+    test "falls back to the lowest-impl_order requirement once no eligible issue remains" do
+      assert {:ok, req1} = Tasks.register_task(@valid_attrs)
+      assert {:ok, _req2} = Tasks.register_task(@valid_attrs)
+      assert {:ok, issue} = Tasks.register_task(@issue_attrs)
+
+      assert {:ok, claimed1} = Tasks.get_next_task("agent-1")
+      assert claimed1.id == issue.id
+
+      # The issue is now locked (no longer eligible) -- falls through to
+      # requirement FIFO order, unaffected by the issue's higher id.
+      assert {:ok, claimed2} = Tasks.get_next_task("agent-2")
+      assert claimed2.id == req1.id
+      assert claimed2.task_type == "requirement"
+    end
+
+    test "a locked issue does not block requirement claims" do
+      assert {:ok, req} = Tasks.register_task(@valid_attrs)
+      assert {:ok, issue} = Tasks.register_task(@issue_attrs)
+
+      assert {:ok, _} = Tasks.set_lock(issue.id, "agent-x")
+
+      assert {:ok, claimed} = Tasks.get_next_task("agent-1")
+      assert claimed.id == req.id
     end
   end
 

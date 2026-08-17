@@ -8,7 +8,8 @@ defmodule LetflowQueueWeb.TaskControllerTest do
   @valid_attrs %{
     "title" => "Do the thing",
     "description" => "A thing that needs doing",
-    "acceptance_criteria" => ["criterion one"]
+    "acceptance_criteria" => ["criterion one"],
+    "task_type" => "requirement"
   }
 
   defp authed(conn) do

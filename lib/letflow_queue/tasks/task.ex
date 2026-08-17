@@ -16,6 +16,7 @@ defmodule LetflowQueue.Tasks.Task do
   import Ecto.Changeset
 
   @statuses ~w(open done blocked)
+  @task_types ~w(requirement issue)
 
   schema "tasks" do
     field :title, :string
@@ -24,6 +25,10 @@ defmodule LetflowQueue.Tasks.Task do
     field :depends_on, LetflowQueue.Tasks.JSONIntList, default: []
     field :stage, :string
     field :status, :string, default: "open"
+    # "requirement" (planned WF-01 work) or "issue" (incidental, via
+    # ISSUE_QUEUE.md, or imported from a GitHub Issue). Drives
+    # get_next_task/1's claim priority — see LetflowQueue.Tasks.
+    field :task_type, :string
     field :locked_by, :string
     field :locked_at, :utc_datetime
     # Non-nil when this task has a linked GitHub Issue — either created by
@@ -38,11 +43,25 @@ defmodule LetflowQueue.Tasks.Task do
     timestamps(type: :utc_datetime)
   end
 
-  @doc "Changeset for creating a new task via register_task/1."
+  @doc """
+  Changeset for creating a new task via register_task/1.
+
+  `task_type` is required — the caller (always ORCH) must state whether
+  this is a planned requirement or an incidental issue; get_next_task/1
+  has no reliable way to infer it after the fact.
+  """
   def create_changeset(task, attrs) do
     task
-    |> cast(attrs, [:title, :description, :acceptance_criteria, :depends_on, :stage])
-    |> validate_required([:title, :description, :acceptance_criteria])
+    |> cast(attrs, [
+      :title,
+      :description,
+      :acceptance_criteria,
+      :depends_on,
+      :stage,
+      :task_type
+    ])
+    |> validate_required([:title, :description, :acceptance_criteria, :task_type])
+    |> validate_inclusion(:task_type, @task_types)
     |> validate_length(:acceptance_criteria, min: 1)
     |> validate_change(:acceptance_criteria, fn :acceptance_criteria, list ->
       if is_list(list) and Enum.all?(list, &is_binary/1) do
@@ -76,7 +95,10 @@ defmodule LetflowQueue.Tasks.Task do
   express queue-native dependencies). `description` is a required NOT NULL
   column at the DB level but isn't meaningful for a GitHub-imported task
   (the verbatim issue text lives in `body` instead), so it's set to an
-  empty string here rather than left unset.
+  empty string here rather than left unset. `task_type` is always
+  `"issue"` — a raw GitHub Issue is by definition incidental, never a
+  planned requirement (those always come through register_task/1 with an
+  explicit `task_type`).
   """
   def github_import_changeset(task, attrs) do
     task
@@ -86,6 +108,7 @@ defmodule LetflowQueue.Tasks.Task do
     |> put_change(:acceptance_criteria, ["See linked GitHub issue for full description"])
     |> put_change(:depends_on, [])
     |> put_change(:stage, nil)
+    |> put_change(:task_type, "issue")
     |> unique_constraint(:github_issue_number)
   end
 
@@ -96,6 +119,9 @@ defmodule LetflowQueue.Tasks.Task do
 
   @doc false
   def statuses, do: @statuses
+
+  @doc false
+  def task_types, do: @task_types
 
   @doc """
   Returns the task as a plain map suitable for JSON encoding, with
@@ -110,6 +136,7 @@ defmodule LetflowQueue.Tasks.Task do
       acceptance_criteria: task.acceptance_criteria,
       depends_on: task.depends_on,
       stage: task.stage,
+      task_type: task.task_type,
       status: task.status,
       locked_by: task.locked_by,
       locked_at: task.locked_at,
