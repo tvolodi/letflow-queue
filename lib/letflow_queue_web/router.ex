@@ -16,8 +16,8 @@ defmodule LetflowQueueWeb.Router do
     get "/health", HealthController, :show
   end
 
-  # The entire externally-callable surface: exactly four operations on the
-  # task queue, all bearer-token gated. Nothing else is routed.
+  # The task-queue surface: exactly four operations, all bearer-token
+  # gated. Nothing else task-related is routed.
   scope "/tasks", LetflowQueueWeb do
     pipe_through [:api, :authenticated]
 
@@ -25,5 +25,16 @@ defmodule LetflowQueueWeb.Router do
     get "/next", TaskController, :next
     post "/:id/lock", TaskController, :lock
     post "/:id/release", TaskController, :release
+  end
+
+  # Admin-facing key management -- a separate concern from the four task
+  # operations above (see README.md "Client API keys"). Same bearer-auth
+  # gate: minting a new key requires already holding a valid credential
+  # (the legacy QUEUE_AUTH_TOKEN, or another still-active api key).
+  scope "/api_keys", LetflowQueueWeb do
+    pipe_through [:api, :authenticated]
+
+    post "/", ApiKeyController, :create
+    post "/:id/revoke", ApiKeyController, :revoke
   end
 end

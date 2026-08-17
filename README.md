@@ -13,11 +13,14 @@ services to run).
 
 ## Design
 
-There are exactly **four** externally-callable operations. This is
-deliberate: an AI agent driving this service can register a task, claim
-the next eligible one, and lock/release — nothing else. There is no
-generic CRUD, no way to list/edit/delete tasks outside that lock
-protocol, and no way to bypass the atomic-claim semantics.
+The task queue itself has exactly **four** externally-callable
+operations. This is deliberate: an AI agent driving this service can
+register a task, claim the next eligible one, and lock/release —
+nothing else. There is no generic CRUD, no way to list/edit/delete
+tasks outside that lock protocol, and no way to bypass the atomic-claim
+semantics. (A separate, small key-management surface — "Client API
+keys" below — exists alongside this for auth administration; it isn't
+part of the four.)
 
 1. **register_task** — create a new task.
 2. **get_next_task** — atomically claim the single next eligible task
@@ -85,11 +88,80 @@ GitHub configuration at all; you only lose the GitHub-side visibility.
 ## Auth
 
 Every endpoint except `GET /health` requires
-`Authorization: Bearer <token>`, checked against the single shared
-token in the `QUEUE_AUTH_TOKEN` environment variable (read at boot in
-`config/runtime.exs`, never hardcoded). There is no token
-generation/rotation endpoint — the token is provisioned out of band and
-shared by every host/agent that talks to this service.
+`Authorization: Bearer <token>`. Two credential forms are accepted
+(`LetflowQueueWeb.AuthPlug`):
+
+1. **The legacy shared token** — `QUEUE_AUTH_TOKEN`, an environment
+   variable read at boot (`config/runtime.exs`, never hardcoded),
+   provisioned out of band on the server. Still valid so already-deployed
+   clients keep working, and because it's what bootstraps a brand-new
+   client's own key (below). New clients shouldn't adopt it directly —
+   it's shared and can't be revoked per-client.
+2. **A per-client API key** (`LetflowQueue.ApiKeys`) — the intended path
+   for every client going forward. Minted once via `POST /api_keys`,
+   handed to that client in the response, and never retrievable again.
+   Independently revocable, and doesn't require server/SSH access to
+   obtain — see "Client API keys" below.
+
+Both forms are checked on every authenticated request: the legacy token
+via constant-time comparison, a per-client key via a SHA-256 hash lookup
+(the raw token itself is never stored, so a leaked database dump doesn't
+expose usable credentials).
+
+## Client API keys
+
+The problem this solves: previously, `QUEUE_AUTH_TOKEN` was the *only*
+credential, and it lived solely in the server's own `.env` file — so any
+new client (a fresh host, a fresh agent session) had to SSH into the
+server just to read the value it needed to make its first API call. Per-
+client keys remove that: a client that already holds *any* valid
+credential can mint itself (or another client) a new one over the API,
+no server access required.
+
+**Bootstrapping the very first key for a new deployment** still requires
+`QUEUE_AUTH_TOKEN` once (there's nothing else to authenticate with yet).
+After that, minting further keys — for additional hosts, or to rotate an
+existing client off the legacy token — only needs an already-active key.
+
+```bash
+# Mint a new key (requires an existing valid credential — the legacy
+# token, or another active key — as the bearer token below):
+curl -X POST https://queue-test.ai-dala.com/api_keys \
+  -H "Authorization: Bearer $QUEUE_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"label": "vlad-workstation"}'
+```
+
+```json
+{
+  "data": {
+    "id": 1,
+    "label": "vlad-workstation",
+    "token": "lfq_9f2c...redacted...",
+    "revoked_at": null,
+    "inserted_at": "2026-08-17T00:00:00Z"
+  },
+  "error": null
+}
+```
+
+`token` is present **only in this create response** — store it locally
+on that client immediately (never in a tracked file); it cannot be
+retrieved again. From then on, that client authenticates with
+`Authorization: Bearer lfq_9f2c...` on every call, including future
+`POST /api_keys` calls to mint keys for other clients.
+
+```bash
+# Revoke a leaked or retired key (also requires a valid credential):
+curl -X POST https://queue-test.ai-dala.com/api_keys/1/revoke \
+  -H "Authorization: Bearer $SOME_STILL_VALID_TOKEN"
+```
+
+Revoking is idempotent — calling it again on an already-revoked key
+succeeds without error. There's no list/enumerate endpoint (same
+minimal-surface philosophy as the task queue itself) — record each
+key's `label` ↔ purpose in `ai-dala-infra`'s secrets-inventory when you
+mint it, the same convention already used for `QUEUE_AUTH_TOKEN` itself.
 
 ## Response envelope
 
@@ -265,6 +337,13 @@ behavior described above, against `LetflowQueue.GitHub.FakeClient`
 `LetflowQueue.GitHub.ReqClient`, configured via
 `config :letflow_queue, github_client: ...` in `config/test.exs`. No test
 in this suite makes a real network call to GitHub.
+
+`test/letflow_queue/api_keys_test.exs` and
+`test/letflow_queue_web/controllers/api_key_controller_test.exs` cover
+per-client key minting, hashing (the plaintext token is never persisted),
+revocation, and the dual-credential `AuthPlug` behavior end-to-end
+against the task endpoints (a minted key authenticates `GET /tasks/next`;
+a revoked one is rejected).
 
 ## Deploying
 
