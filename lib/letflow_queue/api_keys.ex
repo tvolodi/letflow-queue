@@ -78,7 +78,8 @@ defmodule LetflowQueue.ApiKeys do
   end
 
   defp generate_token do
-    @token_prefix <> (@token_bytes |> :crypto.strong_rand_bytes() |> Base.url_encode64(padding: false))
+    @token_prefix <>
+      (@token_bytes |> :crypto.strong_rand_bytes() |> Base.url_encode64(padding: false))
   end
 
   defp hash(token) do
