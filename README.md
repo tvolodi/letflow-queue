@@ -21,8 +21,10 @@ protocol, and no way to bypass the atomic-claim semantics.
 
 1. **register_task** — create a new task.
 2. **get_next_task** — atomically claim the single next eligible task
-   (lowest `impl_order`, `status = "open"`, unlocked, all dependencies
-   `"done"`).
+   (`status = "open"`, unlocked, all dependencies `"done"`). Two-tier
+   priority: the **newest** eligible `task_type: "issue"` task if one
+   exists, else the **lowest-`impl_order`** eligible `task_type:
+   "requirement"` task.
 3. **set_lock** — explicit manual (re-)lock of a task you already know
    the id of (e.g. re-acquiring your own lock after a crash).
 4. **release_lock** — release a lock, optionally transitioning status,
@@ -33,7 +35,9 @@ Every task row: `id` (= `impl_order`, autoincrement primary key),
 `title`, `description`, `acceptance_criteria` (JSON list of strings),
 `depends_on` (JSON list of other task ids), `stage` (free-form string,
 purely informational — mirrors Letflow's S0–S8 stage tags with no
-validation), `status` (`"open"` | `"done"` | `"blocked"`), `locked_by`,
+validation), `task_type` (`"requirement"` | `"issue"` — required on
+`register_task`; drives `get_next_task`'s claim priority, see below),
+`status` (`"open"` | `"done"` | `"blocked"`), `locked_by`,
 `locked_at`, `github_issue_number` (nullable — see "GitHub Issues sync"
 below), `body` (nullable — full verbatim GitHub issue text, only set for
 tasks imported from GitHub), `inserted_at`/`updated_at`.
@@ -61,8 +65,10 @@ visibility, in both directions:
    (a raw issue body doesn't map onto a structured criteria list),
    `depends_on = []` (GitHub-originated tasks have no way to express
    queue-native dependencies — a known, accepted limitation), `stage =
-   nil`. This import runs *before* the existing atomic-claim query, so an
-   imported issue can be claimed in the same call that imported it.
+   nil`, `task_type = "issue"` (a raw GitHub Issue is always incidental,
+   never a planned requirement). This import runs *before* the existing
+   atomic-claim query, so an imported issue can be claimed in the same
+   call that imported it.
 3. **`release_lock` → GitHub.** Releasing a task's lock with
    `status: "done"` closes the linked GitHub Issue, if the task has a
    non-nil `github_issue_number`.
@@ -109,13 +115,15 @@ curl -X POST http://localhost:4000/tasks \
     "description": "Add the foo endpoint per docs/requirements.yaml",
     "acceptance_criteria": ["mix test passes", "REVIEWER sign-off recorded"],
     "depends_on": [12, 13],
-    "stage": "S2"
+    "stage": "S2",
+    "task_type": "requirement"
   }'
 ```
 
 `title`, `description`, `acceptance_criteria` (non-empty list of
-strings) are required. `depends_on` (list of other task ids) and
-`stage` are optional. Response (`201 Created`):
+strings), and `task_type` (`"requirement"` or `"issue"`) are required.
+`depends_on` (list of other task ids) and `stage` are optional. Response
+(`201 Created`):
 
 ```json
 {
@@ -127,6 +135,7 @@ strings) are required. `depends_on` (list of other task ids) and
     "acceptance_criteria": ["mix test passes", "REVIEWER sign-off recorded"],
     "depends_on": [12, 13],
     "stage": "S2",
+    "task_type": "requirement",
     "status": "open",
     "locked_by": null,
     "locked_at": null,
@@ -142,10 +151,12 @@ human-readable `error` string.
 
 ### `GET /tasks/next?agent_id=<id>` — get_next_task
 
-Atomically finds the lowest-`impl_order` task that is `status = "open"`,
-unlocked, and whose every `depends_on` id is `status = "done"` in the
-same statement that claims it (sets `locked_by`/`locked_at`) — so two
-concurrent callers can never receive the same task.
+Atomically claims a task that is `status = "open"`, unlocked, and whose
+every `depends_on` id is `status = "done"`, in the same statement that
+sets `locked_by`/`locked_at` — so two concurrent callers can never
+receive the same task. Priority is two-tier: the **newest** (highest
+`impl_order`) eligible `task_type: "issue"` task if one exists, else the
+**lowest-`impl_order`** eligible `task_type: "requirement"` task.
 
 ```bash
 curl "http://localhost:4000/tasks/next?agent_id=host-a" \

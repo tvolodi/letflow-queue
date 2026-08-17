@@ -25,7 +25,9 @@ defmodule LetflowQueue.Tasks do
 
   @doc """
   Creates a new task with an auto-incrementing `impl_order` (== `id`).
-  Status starts as `"open"`.
+  Status starts as `"open"`. `task_type` (`"requirement"` or `"issue"`)
+  is required — it drives `get_next_task/1`'s claim priority and has no
+  reliable way to be inferred after the fact.
 
   Also creates a corresponding GitHub Issue on the configured repo
   (`GITHUB_REPO`) as **best-effort** sync: title = task title, body = task
@@ -90,10 +92,18 @@ defmodule LetflowQueue.Tasks do
   First imports any open GitHub Issues not yet tracked locally as new
   `"open"` tasks (best-effort — skipped entirely if GitHub isn't
   configured or the API call fails, never blocking the claim below), then
-  atomically finds and claims the lowest-`impl_order` task that is
-  `status = "open"`, unlocked, and whose every `depends_on` id is
-  `status = "done"` — setting `locked_by`/`locked_at` for it in a single
-  SQL statement so two concurrent callers can never claim the same row.
+  atomically claims the next eligible task — `status = "open"`, unlocked,
+  and every `depends_on` id `status = "done"` — setting
+  `locked_by`/`locked_at` for it in a single SQL statement so two
+  concurrent callers can never claim the same row.
+
+  Claim priority is two-tier:
+
+    1. If any eligible `task_type: "issue"` task exists, the **newest**
+       one (highest id) is claimed — issues jump the line, most recent
+       first.
+    2. Otherwise, the eligible `task_type: "requirement"` task with the
+       **lowest** `impl_order` (id) is claimed — unchanged FIFO order.
 
   Returns `{:ok, task}` on success, or `{:error, :no_eligible_task}` if
   nothing is currently claimable.
@@ -105,32 +115,53 @@ defmodule LetflowQueue.Tasks do
     now = DateTime.utc_now() |> DateTime.truncate(:second)
 
     # The eligibility predicate (open, unlocked, all dependencies done) is
-    # evaluated inside the same UPDATE statement that performs the claim,
-    # via a correlated subquery selecting the single lowest-impl_order
-    # candidate row. SQLite executes writers serially, and wrapping this in
-    # an explicit transaction ensures the SELECT-then-UPDATE the query
-    # planner performs internally can't interleave with another writer —
-    # so two concurrent callers can never both claim the same row.
+    # evaluated inside the same UPDATE statement that performs the claim.
+    # The candidate id is COALESCE of two scalar subqueries: the newest
+    # eligible issue-type task (id DESC), falling back to the
+    # lowest-impl_order eligible requirement-type task (id ASC) only when
+    # no eligible issue exists. SQLite executes writers serially, and
+    # wrapping this in an explicit transaction ensures the SELECT-then-
+    # UPDATE the query planner performs internally can't interleave with
+    # another writer — so two concurrent callers can never both claim the
+    # same row.
     query = """
     UPDATE tasks
     SET locked_by = ?1, locked_at = ?2, updated_at = ?2
-    WHERE id = (
-      SELECT t.id FROM tasks t
-      WHERE t.status = 'open'
-        AND t.locked_by IS NULL
-        AND NOT EXISTS (
-          SELECT 1 FROM json_each(t.depends_on) dep
-          WHERE NOT EXISTS (
-            SELECT 1 FROM tasks dt
-            WHERE dt.id = dep.value AND dt.status = 'done'
+    WHERE id = COALESCE(
+      (
+        SELECT t.id FROM tasks t
+        WHERE t.status = 'open'
+          AND t.locked_by IS NULL
+          AND t.task_type = 'issue'
+          AND NOT EXISTS (
+            SELECT 1 FROM json_each(t.depends_on) dep
+            WHERE NOT EXISTS (
+              SELECT 1 FROM tasks dt
+              WHERE dt.id = dep.value AND dt.status = 'done'
+            )
           )
-        )
-      ORDER BY t.id ASC
-      LIMIT 1
+        ORDER BY t.id DESC
+        LIMIT 1
+      ),
+      (
+        SELECT t.id FROM tasks t
+        WHERE t.status = 'open'
+          AND t.locked_by IS NULL
+          AND t.task_type = 'requirement'
+          AND NOT EXISTS (
+            SELECT 1 FROM json_each(t.depends_on) dep
+            WHERE NOT EXISTS (
+              SELECT 1 FROM tasks dt
+              WHERE dt.id = dep.value AND dt.status = 'done'
+            )
+          )
+        ORDER BY t.id ASC
+        LIMIT 1
+      )
     )
     RETURNING id, title, description, acceptance_criteria, depends_on,
-      stage, status, locked_by, locked_at, github_issue_number, body,
-      inserted_at, updated_at
+      stage, task_type, status, locked_by, locked_at, github_issue_number,
+      body, inserted_at, updated_at
     """
 
     case Repo.transaction(fn ->
@@ -193,7 +224,8 @@ defmodule LetflowQueue.Tasks do
   # run through the schema's Ecto.Type loaders (decoding the JSON text
   # columns).
   @returning_columns ~w(id title description acceptance_criteria depends_on
-    stage status locked_by locked_at github_issue_number body inserted_at updated_at)
+    stage task_type status locked_by locked_at github_issue_number body
+    inserted_at updated_at)
 
   defp load_task(row) when is_list(row) do
     @returning_columns

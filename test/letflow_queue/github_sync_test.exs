@@ -16,7 +16,8 @@ defmodule LetflowQueue.GithubSyncTest do
   @valid_attrs %{
     "title" => "Do the thing",
     "description" => "A thing that needs doing",
-    "acceptance_criteria" => ["criterion one", "criterion two"]
+    "acceptance_criteria" => ["criterion one", "criterion two"],
+    "task_type" => "requirement"
   }
 
   setup do
@@ -88,6 +89,7 @@ defmodule LetflowQueue.GithubSyncTest do
       assert claimed.acceptance_criteria == ["See linked GitHub issue for full description"]
       assert claimed.depends_on == []
       assert claimed.stage == nil
+      assert claimed.task_type == "issue"
       assert claimed.locked_by == "agent-1"
     end
 
