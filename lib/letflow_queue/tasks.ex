@@ -29,21 +29,65 @@ defmodule LetflowQueue.Tasks do
   is required — it drives `get_next_task/1`'s claim priority and has no
   reliable way to be inferred after the fact.
 
-  Also creates a corresponding GitHub Issue on the configured repo
-  (`GITHUB_REPO`) as **best-effort** sync: title = task title, body = task
-  description + acceptance criteria. If GitHub isn't configured or the API
-  call fails for any reason, this is logged and `register_task/1` still
-  succeeds — the local task is always created regardless of GitHub's
-  availability, with `github_issue_number: nil` in that case.
+  For `task_type: "issue"`, the task is also stamped with a canonical
+  `issue_ref` (`"ISS-"` + zero-padded id, e.g. `"ISS-0186"`) and its title
+  is rewritten to carry that ref as a prefix, replacing any the caller
+  supplied. `issue_ref` is the id a caller should name its local issue
+  record with — it is allocated atomically by the database, so two hosts
+  registering at the same moment can never receive the same one. See
+  `LetflowQueue.Tasks.Task.issue_ref/1` for why this replaced callers
+  choosing their own number, and what it cost when they did.
+
+  ## GitHub linkage
+
+  Two mutually exclusive paths, chosen by whether the caller passes
+  `github_issue_number`:
+
+    * **Omitted (the default)** — this function creates a GitHub Issue on
+      the configured repo (`GITHUB_REPO`) as **best-effort** sync: title =
+      the canonical title, body = description + acceptance criteria. If
+      GitHub isn't configured or the API call fails, this is logged and
+      `register_task/1` still succeeds with `github_issue_number: nil`.
+
+    * **Supplied** — the caller has already filed the issue itself, so this
+      function **adopts that number and creates nothing**. This exists
+      because the previous unconditional-create behaviour meant a caller who
+      had filed its own issue ended up with two: its own (carrying the real
+      diagnosis) and a service-created mirror. The task row then pointed at
+      the mirror, so `release_lock/2`'s close-on-done closed the mirror and
+      left the real issue open, and every such pair had to be reconciled by
+      hand via a note in the local record. That happened twice in Letflow
+      before this path existed.
+
+  A supplied number that is already linked to another task is rejected with
+  a changeset error (there is a unique index on the column) rather than
+  silently stealing the link.
 
   Returns `{:ok, task}` or `{:error, changeset}`.
   """
   @spec register_task(map()) :: {:ok, Task.t()} | {:error, Ecto.Changeset.t()}
   def register_task(attrs) when is_map(attrs) do
-    with {:ok, task} <- %Task{} |> Task.create_changeset(attrs) |> Repo.insert() do
-      {:ok, maybe_create_github_issue(task)}
+    with {:ok, task} <- %Task{} |> Task.create_changeset(attrs) |> Repo.insert(),
+         {:ok, task} <- put_canonical_title(task) do
+      {:ok, maybe_link_github_issue(task)}
     end
   end
+
+  # The canonical title depends on the task's id, which only exists after the
+  # insert — hence a second write rather than a changeset step. A no-op for
+  # requirement-type tasks and for issue-type tasks whose title already
+  # matches, so it costs an UPDATE only when it actually changes something.
+  defp put_canonical_title(%Task{title: title} = task) do
+    case Task.canonical_title(task) do
+      ^title -> {:ok, task}
+      canonical -> task |> Ecto.Changeset.change(title: canonical) |> Repo.update()
+    end
+  end
+
+  # Caller already filed the issue and passed its number: adopt it, create
+  # nothing. Otherwise fall through to creating one.
+  defp maybe_link_github_issue(%Task{github_issue_number: n} = task) when is_integer(n), do: task
+  defp maybe_link_github_issue(%Task{} = task), do: maybe_create_github_issue(task)
 
   defp maybe_create_github_issue(task) do
     case GitHub.create_issue(task.title, issue_body(task)) do

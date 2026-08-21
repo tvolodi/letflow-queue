@@ -72,6 +72,72 @@ defmodule LetflowQueue.GithubSyncTest do
     end
   end
 
+  describe "register_task/1 adopting a caller-filed GitHub issue" do
+    @issue_attrs %{
+      "title" => "Something broke",
+      "description" => "and here is the diagnosis",
+      "acceptance_criteria" => ["See linked GitHub issue for full description"],
+      "task_type" => "issue"
+    }
+
+    test "adopts a supplied github_issue_number and creates no second issue" do
+      FakeClient.set_create_issue_result({:ok, 4242})
+
+      assert {:ok, task} =
+               Tasks.register_task(Map.put(@issue_attrs, "github_issue_number", 354))
+
+      assert task.github_issue_number == 354
+      # The whole point: no mirror issue was filed alongside the caller's own.
+      assert FakeClient.calls(:create_issue) == []
+    end
+
+    test "closing on done closes the ADOPTED issue, not a service-created mirror" do
+      # This is the bug the adopt path fixes. Previously the task row pointed
+      # at the service's mirror, so release_lock closed the mirror and left
+      # the caller's real issue -- the one carrying the diagnosis -- open.
+      FakeClient.set_create_issue_result({:ok, 355})
+      FakeClient.set_close_issue_result({:ok, :closed})
+
+      assert {:ok, task} =
+               Tasks.register_task(Map.put(@issue_attrs, "github_issue_number", 354))
+
+      assert {:ok, _} = Tasks.release_lock(task.id, agent_id: "agent-1", status: "done")
+
+      assert [{"tvolodi/letflow", 354}] = FakeClient.calls(:close_issue)
+    end
+
+    test "still creates an issue when no number is supplied" do
+      FakeClient.set_create_issue_result({:ok, 4242})
+
+      assert {:ok, task} = Tasks.register_task(@issue_attrs)
+
+      assert task.github_issue_number == 4242
+      assert [{"tvolodi/letflow", _title, _body}] = FakeClient.calls(:create_issue)
+    end
+
+    test "the created issue's title carries the authoritative issue ref" do
+      # A human scanning the GitHub issue list sees the same id as the local
+      # record, without anyone having had to guess it.
+      FakeClient.set_create_issue_result({:ok, 4242})
+
+      assert {:ok, task} = Tasks.register_task(@issue_attrs)
+
+      ref = LetflowQueue.Tasks.Task.issue_ref(task)
+      assert [{"tvolodi/letflow", title, _body}] = FakeClient.calls(:create_issue)
+      assert title == ref <> ": Something broke"
+    end
+
+    test "rejects a number already linked to another task rather than stealing the link" do
+      assert {:ok, _first} =
+               Tasks.register_task(Map.put(@issue_attrs, "github_issue_number", 354))
+
+      assert {:error, changeset} =
+               Tasks.register_task(Map.put(@issue_attrs, "github_issue_number", 354))
+
+      assert %{github_issue_number: _} = errors_on(changeset)
+    end
+  end
+
   describe "get_next_task/1 GitHub issue import" do
     test "imports an open GitHub issue not yet tracked as a new, claimable local task" do
       FakeClient.set_list_open_issues_result(

@@ -49,6 +49,44 @@ tasks imported from GitHub), `inserted_at`/`updated_at`.
 under both names in every JSON response so callers don't have to know
 that "id" doubles as the queue's implementation order.
 
+## Issue refs — why the queue allocates them
+
+Every response also carries **`issue_ref`**: for `task_type: "issue"`,
+`"ISS-"` plus the zero-padded `id` (task 186 → `"ISS-0186"`); `null` for
+requirements. This is the id a caller should name its own local issue
+record with, and for issue-type tasks the queue also rewrites the task's
+`title` to carry the ref as a prefix — replacing any `ISS-NNNN:` the
+caller supplied.
+
+**This exists because callers cannot safely pick the number themselves.**
+Letflow's agents previously derived the next id by scanning a directory
+of `ISS-NNNN.yaml` files and taking the highest plus one. That is a
+read-then-write race with no lock between the halves, and across
+concurrent sessions on different hosts it collided **eight** separate
+times — once silently overwriting another session's file while a live
+GitHub issue still pointed at it, and once in a run that scanned every
+remote branch first, exactly as its own documentation prescribed, and
+collided anyway because the colliding numbers did not exist on any branch
+at the moment it looked.
+
+A scan cannot reserve a number; only an allocator can. `id` is an
+autoincrement primary key, so the database allocates it atomically and no
+two callers can ever receive the same one — deriving the ref from it
+inherits that guarantee with no second sequence to keep consistent, no
+retry path, and nothing to go wrong under concurrency.
+
+The trade is that refs are **not contiguous**: ids are shared with
+requirement-type tasks, and any pre-existing hand-numbered issues occupy a
+lower range. That is deliberate. Contiguity was never worth having — the
+collisions and the renumbering they forced had already destroyed it — and
+it is exactly the property that cannot be delivered without a guess.
+
+The title rewrite is the enforcement half. Without it a caller could still
+put a guessed number in the title, and that guess — not the allocated ref
+— is what a human would read in the GitHub issue list. Only a *leading*
+`ISS-NNNN:` token is replaced; an `ISS-` reference elsewhere in the title
+is a genuine cross-reference to another issue and is left verbatim.
+
 ## GitHub Issues sync
 
 The four operations above remain the only *control* surface — agents
@@ -56,10 +94,21 @@ never read or write GitHub Issues to drive the queue. Separately, this
 service optionally mirrors queue state into GitHub's own UI for human
 visibility, in both directions:
 
-1. **`register_task` → GitHub.** Every call to `register_task` also
-   creates a GitHub Issue on the configured repo: title = task title,
-   body = task description + acceptance criteria. The returned issue
-   number is stored on the task row as `github_issue_number`.
+1. **`register_task` → GitHub.** By default, `register_task` also creates
+   a GitHub Issue on the configured repo: title = the canonical title
+   (carrying the `issue_ref` prefix, see above), body = task description +
+   acceptance criteria. The returned issue number is stored on the task row
+   as `github_issue_number`.
+
+   **Unless the caller passes `github_issue_number` itself**, in which case
+   the service *adopts* that number and creates nothing. This matters when
+   the caller has already filed the issue — previously the unconditional
+   create left it with two issues for one finding: its own, carrying the
+   real diagnosis, and a service-created mirror. The task row pointed at
+   the mirror, so the close-on-done in (3) below closed the mirror and left
+   the real issue open, and each pair had to be reconciled by a hand-written
+   note in the local record. A supplied number already linked to another
+   task is rejected (unique index) rather than silently re-pointed.
 2. **GitHub → `get_next_task`.** Every call to `get_next_task` first
    pulls the repo's open issues and imports any not already tracked
    (matched by `github_issue_number`) as new local tasks — title = issue
@@ -194,14 +243,24 @@ curl -X POST http://localhost:4000/tasks \
 
 `title`, `description`, `acceptance_criteria` (non-empty list of
 strings), and `task_type` (`"requirement"` or `"issue"`) are required.
-`depends_on` (list of other task ids) and `stage` are optional. Response
-(`201 Created`):
+`depends_on` (list of other task ids) and `stage` are optional, as is
+`github_issue_number` — pass it only when you have already filed the
+GitHub issue yourself and want the service to adopt it instead of
+creating a second one (see "GitHub Issues sync" above).
+
+For `task_type: "issue"`, the response's `issue_ref` is the allocated id
+to name your local record with, and `title` comes back rewritten with that
+ref as a prefix (see "Issue refs" above). Do **not** put a guessed
+`ISS-NNNN:` in the title you send — a leading one is stripped and replaced.
+
+Response (`201 Created`):
 
 ```json
 {
   "data": {
     "id": 42,
     "impl_order": 42,
+    "issue_ref": null,
     "title": "Implement REQ-042",
     "description": "Add the foo endpoint per docs/requirements.yaml",
     "acceptance_criteria": ["mix test passes", "REVIEWER sign-off recorded"],

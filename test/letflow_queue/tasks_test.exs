@@ -2,6 +2,9 @@ defmodule LetflowQueue.TasksTest do
   use LetflowQueue.DataCase, async: false
 
   alias LetflowQueue.Tasks
+  # Aliased under a distinct name rather than `Task` so Elixir's own `Task`
+  # module stays reachable from this file.
+  alias LetflowQueue.Tasks.Task, as: TaskSchema
 
   @valid_attrs %{
     "title" => "Do the thing",
@@ -366,6 +369,73 @@ defmodule LetflowQueue.TasksTest do
 
       assert {:error, :invalid_status} =
                Tasks.release_lock(task.id, agent_id: "agent-1", status: "bogus")
+    end
+  end
+
+  describe "issue_ref allocation" do
+    # The point of issue_ref is that a caller cannot choose the number. These
+    # assert it is DERIVED from the id -- and therefore inherits the primary
+    # key's atomic allocation -- rather than asserting any literal value.
+    # Note deliberately not tested here: that two concurrent registrations
+    # get distinct refs. That property belongs to the database's autoincrement
+    # primary key, not to this code, and a test driving concurrent writers
+    # through the Ecto sandbox's single checked-out connection would exercise
+    # the sandbox rather than the guarantee.
+
+    test "an issue-type task gets a zero-padded ref derived from its id" do
+      assert {:ok, task} = Tasks.register_task(@issue_attrs)
+
+      assert TaskSchema.issue_ref(task) == "ISS-" <> String.pad_leading("#{task.id}", 4, "0")
+      assert TaskSchema.to_json_map(task).issue_ref == TaskSchema.issue_ref(task)
+    end
+
+    test "a requirement-type task has no issue ref" do
+      assert {:ok, task} = Tasks.register_task(@valid_attrs)
+
+      assert TaskSchema.issue_ref(task) == nil
+      assert TaskSchema.to_json_map(task).issue_ref == nil
+    end
+
+    test "separately registered issues get distinct refs" do
+      assert {:ok, a} = Tasks.register_task(@issue_attrs)
+      assert {:ok, b} = Tasks.register_task(@issue_attrs)
+
+      assert TaskSchema.issue_ref(a) != TaskSchema.issue_ref(b)
+    end
+  end
+
+  describe "canonical title" do
+    test "an issue-type task's title is prefixed with its ref" do
+      assert {:ok, task} = Tasks.register_task(@issue_attrs)
+
+      assert task.title == TaskSchema.issue_ref(task) <> ": Do the thing"
+    end
+
+    test "a caller-supplied leading ISS number is replaced by the authoritative one" do
+      # The enforcement half: a caller that guesses a number must not be able
+      # to smuggle it through into what a human later reads.
+      attrs = Map.put(@issue_attrs, "title", "ISS-0110: guessed by the caller")
+
+      assert {:ok, task} = Tasks.register_task(attrs)
+
+      assert task.title == TaskSchema.issue_ref(task) <> ": guessed by the caller"
+      refute task.title =~ "ISS-0110"
+    end
+
+    test "an ISS reference elsewhere in the title is left alone" do
+      # Only a LEADING token is an id claim; anything else is a genuine
+      # cross-reference to another issue and must survive verbatim.
+      attrs = Map.put(@issue_attrs, "title", "regression of ISS-0046 under 1.20")
+
+      assert {:ok, task} = Tasks.register_task(attrs)
+
+      assert task.title == TaskSchema.issue_ref(task) <> ": regression of ISS-0046 under 1.20"
+    end
+
+    test "a requirement-type task's title is untouched" do
+      assert {:ok, task} = Tasks.register_task(@valid_attrs)
+
+      assert task.title == "Do the thing"
     end
   end
 end

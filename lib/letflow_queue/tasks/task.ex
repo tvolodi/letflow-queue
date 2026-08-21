@@ -18,6 +18,16 @@ defmodule LetflowQueue.Tasks.Task do
   @statuses ~w(open done blocked)
   @task_types ~w(requirement issue)
 
+  # Matches a leading "ISS-0123:" token (any digit count, any case, tolerant
+  # of surrounding whitespace) so a caller-supplied one can be stripped and
+  # replaced by the authoritative ref. See `canonical_title/1`.
+  @iss_prefix ~r/\A\s*ISS-\d+\s*:\s*/i
+
+  # Width of the zero-padded numeric part of an issue ref. Four digits
+  # matches the ISS-NNNN convention Letflow's docs/issues/ directory already
+  # uses. Ids past 9999 simply render wider; nothing breaks.
+  @issue_ref_width 4
+
   schema "tasks" do
     field :title, :string
     field :description, :string
@@ -58,10 +68,16 @@ defmodule LetflowQueue.Tasks.Task do
       :acceptance_criteria,
       :depends_on,
       :stage,
-      :task_type
+      :task_type,
+      # Optional. When the caller has ALREADY filed the GitHub issue itself,
+      # it passes the number here and register_task/1 adopts it instead of
+      # creating a second one. Omitting it keeps the original behaviour (the
+      # service files the issue). See LetflowQueue.Tasks.register_task/1.
+      :github_issue_number
     ])
     |> validate_required([:title, :description, :acceptance_criteria, :task_type])
     |> validate_inclusion(:task_type, @task_types)
+    |> unique_constraint(:github_issue_number)
     |> validate_length(:acceptance_criteria, min: 1)
     |> validate_change(:acceptance_criteria, fn :acceptance_criteria, list ->
       if is_list(list) and Enum.all?(list, &is_binary/1) do
@@ -117,6 +133,66 @@ defmodule LetflowQueue.Tasks.Task do
     change(task, github_issue_number: github_issue_number)
   end
 
+  @doc """
+  The canonical issue reference for an issue-type task — `"ISS-"` followed
+  by the task's zero-padded `id`, e.g. task 186 => `"ISS-0186"`. Returns
+  `nil` for `task_type: "requirement"` (requirements are referred to by
+  `REQ-NNN` in Letflow's own docs and are not issues).
+
+  **Why this is derived from `id` rather than allocated separately.** The
+  number has to be unique across every host working the project at once,
+  and `id` already is: it's an autoincrement primary key, so the database
+  allocates it atomically and no two callers can ever receive the same one.
+  Deriving the ref from it inherits that guarantee for free — there is no
+  second sequence to keep consistent, no read-then-write window, and
+  nothing to retry on conflict.
+
+  The alternative this replaces was for each agent to scan a directory of
+  existing `ISS-NNNN.yaml` files and take the highest plus one. That is a
+  read-then-write race with no lock between the halves, and it collided
+  **eight** separate times across concurrent Letflow sessions — including
+  once where the losing side's file was silently overwritten with a live
+  GitHub issue still pointing at it, and once where a run scanned every
+  remote branch first (exactly as its own anti-patterns doc prescribed),
+  still collided, because the colliding numbers did not exist on any branch
+  at the moment it looked. A scan cannot reserve a number; only an
+  allocator can.
+
+  Refs are consequently **not contiguous** — ids are shared with
+  requirement-type tasks, and Letflow's pre-existing hand-numbered issues
+  occupy a lower range. That is deliberate. Contiguity was never a property
+  worth having (the collisions and their renumbering had already broken it)
+  and it is precisely what cannot be delivered without a guess.
+  """
+  @spec issue_ref(t_or_struct :: %__MODULE__{}) :: String.t() | nil
+  def issue_ref(%__MODULE__{task_type: "issue", id: id}) when is_integer(id) do
+    "ISS-" <> String.pad_leading(Integer.to_string(id), @issue_ref_width, "0")
+  end
+
+  def issue_ref(%__MODULE__{}), do: nil
+
+  @doc """
+  The task's title with its authoritative `issue_ref/1` as a prefix.
+
+  For an issue-type task, any leading caller-supplied `ISS-NNNN:` token is
+  **stripped and replaced** with the ref derived from the id. This is the
+  enforcement half of `issue_ref/1`: a caller that guesses a number and puts
+  it in the title would otherwise reintroduce the collision the derived ref
+  exists to prevent, and the guess would then be what a human sees in the
+  GitHub issue list. Only a leading token is touched — an `ISS-` reference
+  appearing anywhere else in the title is left alone, since it is a genuine
+  cross-reference to some other issue.
+
+  Requirement-type titles are returned unchanged.
+  """
+  @spec canonical_title(%__MODULE__{}) :: String.t()
+  def canonical_title(%__MODULE__{title: title} = task) do
+    case issue_ref(task) do
+      nil -> title
+      ref -> ref <> ": " <> String.replace(title, @iss_prefix, "")
+    end
+  end
+
   @doc false
   def statuses, do: @statuses
 
@@ -131,6 +207,10 @@ defmodule LetflowQueue.Tasks.Task do
     %{
       id: task.id,
       impl_order: task.id,
+      # nil for requirement-type tasks. For issue-type tasks this is the
+      # canonical, atomically-allocated issue id the caller should name its
+      # local record with — see issue_ref/1 for why it is derived from id.
+      issue_ref: issue_ref(task),
       title: task.title,
       description: task.description,
       acceptance_criteria: task.acceptance_criteria,
