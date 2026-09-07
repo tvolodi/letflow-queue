@@ -16,11 +16,15 @@ defmodule LetflowQueueWeb.Router do
     get "/health", HealthController, :show
   end
 
-  # The task-queue surface: exactly four operations, all bearer-token
-  # gated. Nothing else task-related is routed.
+  # The task-queue surface, all bearer-token gated. Exactly one of these
+  # mutates a claim (get_next_task via GET /tasks/next); the rest either
+  # write something the caller explicitly asked for (register/lock/
+  # release) or, for GET /tasks, write nothing at all — see
+  # LetflowQueue.Tasks's moduledoc.
   scope "/tasks", LetflowQueueWeb do
     pipe_through [:api, :authenticated]
 
+    get "/", TaskController, :index
     post "/", TaskController, :register
     get "/next", TaskController, :next
     post "/:id/lock", TaskController, :lock

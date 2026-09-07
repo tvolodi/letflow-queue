@@ -1,6 +1,7 @@
 defmodule LetflowQueue.TasksTest do
   use LetflowQueue.DataCase, async: false
 
+  alias LetflowQueue.Repo
   alias LetflowQueue.Tasks
   # Aliased under a distinct name rather than `Task` so Elixir's own `Task`
   # module stays reachable from this file.
@@ -401,6 +402,174 @@ defmodule LetflowQueue.TasksTest do
       assert {:ok, b} = Tasks.register_task(@issue_attrs)
 
       assert TaskSchema.issue_ref(a) != TaskSchema.issue_ref(b)
+    end
+  end
+
+  describe "list_tasks/1" do
+    test "returns every task in the database" do
+      assert {:ok, t1} = Tasks.register_task(@valid_attrs)
+      assert {:ok, t2} = Tasks.register_task(@valid_attrs)
+
+      ids = Tasks.list_tasks() |> Enum.map(& &1.id)
+      assert Enum.sort(ids) == Enum.sort([t1.id, t2.id])
+    end
+
+    test "carries every field the other operations return" do
+      assert {:ok, task} = Tasks.register_task(@valid_attrs)
+
+      [listed] = Tasks.list_tasks()
+
+      for key <- [
+            :id,
+            :impl_order,
+            :issue_ref,
+            :title,
+            :description,
+            :acceptance_criteria,
+            :depends_on,
+            :stage,
+            :task_type,
+            :status,
+            :locked_by,
+            :locked_at,
+            :github_issue_number,
+            :body,
+            :inserted_at,
+            :updated_at
+          ] do
+        assert Map.has_key?(listed, key), "expected listed task to carry #{key}"
+      end
+
+      assert listed.id == task.id
+      assert listed.title == task.title
+    end
+
+    test "performs zero writes: two consecutive calls leave every row byte-identical and create no rows" do
+      Application.put_env(:letflow_queue, :github_token, "test-token")
+      Application.put_env(:letflow_queue, :github_repo, "tvolodi/letflow")
+      LetflowQueue.GitHub.FakeClient.reset()
+
+      LetflowQueue.GitHub.FakeClient.set_list_open_issues_result(
+        {:ok, [%{number: 999, title: "Importable issue", body: "body text"}]}
+      )
+
+      assert {:ok, locked_task} = Tasks.register_task(@valid_attrs)
+      assert {:ok, _} = Tasks.set_lock(locked_task.id, "other-agent")
+
+      before_rows = Repo.all(TaskSchema) |> Enum.map(&Map.from_struct/1) |> Enum.sort_by(& &1.id)
+
+      assert _ = Tasks.list_tasks()
+      assert _ = Tasks.list_tasks()
+
+      after_rows = Repo.all(TaskSchema) |> Enum.map(&Map.from_struct/1) |> Enum.sort_by(& &1.id)
+
+      assert before_rows == after_rows
+      assert length(after_rows) == 1
+
+      # The central property under test: list_tasks/1 must never reach the
+      # GitHub import step get_next_task/1 runs first.
+      assert LetflowQueue.GitHub.FakeClient.calls(:list_open_issues) == []
+
+      Application.delete_env(:letflow_queue, :github_token)
+      Application.delete_env(:letflow_queue, :github_repo)
+    end
+
+    test "blocked_by contains exactly the not-done dependency; eligible is false" do
+      assert {:ok, done_dep} = Tasks.register_task(@valid_attrs)
+      assert {:ok, _} = Tasks.release_lock(done_dep.id, force: true, status: "done")
+
+      assert {:ok, open_dep} = Tasks.register_task(@valid_attrs)
+
+      assert {:ok, gated} =
+               Tasks.register_task(
+                 Map.put(@valid_attrs, "depends_on", [done_dep.id, open_dep.id])
+               )
+
+      listed = Tasks.list_tasks() |> Enum.find(&(&1.id == gated.id))
+
+      assert listed.blocked_by == [open_dep.id]
+      assert listed.eligible == false
+    end
+
+    test "blocked_by is [] and eligible is true when all dependencies are done" do
+      assert {:ok, dep1} = Tasks.register_task(@valid_attrs)
+      assert {:ok, dep2} = Tasks.register_task(@valid_attrs)
+      assert {:ok, _} = Tasks.release_lock(dep1.id, force: true, status: "done")
+      assert {:ok, _} = Tasks.release_lock(dep2.id, force: true, status: "done")
+
+      assert {:ok, task} =
+               Tasks.register_task(Map.put(@valid_attrs, "depends_on", [dep1.id, dep2.id]))
+
+      listed = Tasks.list_tasks() |> Enum.find(&(&1.id == task.id))
+
+      assert listed.blocked_by == []
+      assert listed.eligible == true
+    end
+
+    test "eligible agrees live with get_next_task/1: true before the claim, false after" do
+      assert {:ok, task} = Tasks.register_task(@valid_attrs)
+
+      before_claim = Tasks.list_tasks() |> Enum.find(&(&1.id == task.id))
+      assert before_claim.eligible == true
+
+      assert {:ok, claimed} = Tasks.get_next_task("agent-1")
+      assert claimed.id == task.id
+
+      after_claim = Tasks.list_tasks() |> Enum.find(&(&1.id == task.id))
+      assert after_claim.eligible == false
+    end
+
+    test "filters by status" do
+      assert {:ok, open_task} = Tasks.register_task(@valid_attrs)
+      assert {:ok, done_task} = Tasks.register_task(@valid_attrs)
+      assert {:ok, _} = Tasks.release_lock(done_task.id, force: true, status: "done")
+
+      ids = Tasks.list_tasks(%{"status" => "done"}) |> Enum.map(& &1.id)
+      assert ids == [done_task.id]
+      refute open_task.id in ids
+    end
+
+    test "filters by task_type" do
+      assert {:ok, req} = Tasks.register_task(@valid_attrs)
+      assert {:ok, issue} = Tasks.register_task(@issue_attrs)
+
+      ids = Tasks.list_tasks(%{"task_type" => "issue"}) |> Enum.map(& &1.id)
+      assert ids == [issue.id]
+      refute req.id in ids
+    end
+
+    test "filters by stage" do
+      assert {:ok, s2} = Tasks.register_task(Map.put(@valid_attrs, "stage", "S2"))
+      assert {:ok, _s3} = Tasks.register_task(Map.put(@valid_attrs, "stage", "S3"))
+
+      ids = Tasks.list_tasks(%{"stage" => "S2"}) |> Enum.map(& &1.id)
+      assert ids == [s2.id]
+    end
+
+    test "filters by eligible" do
+      assert {:ok, eligible_task} = Tasks.register_task(@valid_attrs)
+      assert {:ok, locked_task} = Tasks.register_task(@valid_attrs)
+      assert {:ok, _} = Tasks.set_lock(locked_task.id, "agent-1")
+
+      ids = Tasks.list_tasks(%{"eligible" => true}) |> Enum.map(& &1.id)
+      assert ids == [eligible_task.id]
+
+      ids_false = Tasks.list_tasks(%{"eligible" => false}) |> Enum.map(& &1.id)
+      assert ids_false == [locked_task.id]
+    end
+
+    test "combining two filters intersects rather than unions" do
+      assert {:ok, matching} =
+               Tasks.register_task(Map.put(@issue_attrs, "stage", "S2"))
+
+      assert {:ok, _wrong_type} = Tasks.register_task(Map.put(@valid_attrs, "stage", "S2"))
+      assert {:ok, _wrong_stage} = Tasks.register_task(Map.put(@issue_attrs, "stage", "S3"))
+
+      ids =
+        Tasks.list_tasks(%{"task_type" => "issue", "stage" => "S2"})
+        |> Enum.map(& &1.id)
+
+      assert ids == [matching.id]
     end
   end
 
