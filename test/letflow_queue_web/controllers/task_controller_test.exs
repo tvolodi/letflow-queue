@@ -22,6 +22,11 @@ defmodule LetflowQueueWeb.TaskControllerTest do
       assert json_response(conn, 401)["error"] == "unauthorized"
     end
 
+    test "GET /tasks without a bearer token is rejected with 401", %{conn: conn} do
+      conn = get(conn, ~p"/tasks")
+      assert json_response(conn, 401)["error"] == "unauthorized"
+    end
+
     test "requests with the wrong bearer token are rejected with 401", %{conn: conn} do
       conn =
         conn
@@ -55,6 +60,39 @@ defmodule LetflowQueueWeb.TaskControllerTest do
 
       assert %{"data" => nil, "error" => error} = json_response(conn, 422)
       assert error =~ "title"
+    end
+  end
+
+  describe "GET /tasks (list_tasks)" do
+    test "returns 200 with a tasks key covering every task in the database", %{conn: conn} do
+      {:ok, t1} = Tasks.register_task(@valid_attrs)
+      {:ok, t2} = Tasks.register_task(@valid_attrs)
+
+      conn = conn |> authed() |> get(~p"/tasks")
+
+      assert %{"tasks" => tasks} = json_response(conn, 200)
+      ids = Enum.map(tasks, & &1["id"])
+      assert Enum.sort(ids) == Enum.sort([t1.id, t2.id])
+    end
+
+    test "each task carries computed blocked_by and eligible fields", %{conn: conn} do
+      {:ok, _task} = Tasks.register_task(@valid_attrs)
+
+      conn = conn |> authed() |> get(~p"/tasks")
+
+      assert %{"tasks" => [task]} = json_response(conn, 200)
+      assert task["blocked_by"] == []
+      assert task["eligible"] == true
+    end
+
+    test "filters combine via query params", %{conn: conn} do
+      {:ok, issue} = Tasks.register_task(Map.put(@valid_attrs, "task_type", "issue"))
+      {:ok, _req} = Tasks.register_task(@valid_attrs)
+
+      conn = conn |> authed() |> get(~p"/tasks?task_type=issue")
+
+      assert %{"tasks" => [task]} = json_response(conn, 200)
+      assert task["id"] == issue.id
     end
   end
 

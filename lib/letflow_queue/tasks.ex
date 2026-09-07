@@ -2,14 +2,25 @@ defmodule LetflowQueue.Tasks do
   @moduledoc """
   Business logic for the shared task queue. This is the only module that
   touches `LetflowQueue.Repo` for task data — the web layer (controllers)
-  calls into these four functions and nothing else, so this module *is*
-  the entire externally-reachable surface for AI agents driving the queue.
+  calls into these functions and nothing else, so this module *is* the
+  entire externally-reachable surface for AI agents driving the queue.
 
     * `register_task/1` — create a new task
     * `get_next_task/1` — atomically claim the next eligible task
     * `set_lock/2` — explicit manual (re-)lock of a known task
     * `release_lock/2` — release a lock, optionally transitioning status,
       optionally with an admin/ORCH `force` override
+    * `list_tasks/1` — read-only listing with computed eligibility;
+      performs no write of any kind (see its own doc)
+
+  There is exactly **one** mutating claim path (`get_next_task/1`'s atomic
+  `UPDATE ... RETURNING`) — every other function either writes something
+  explicit the caller asked for (register/lock/release) or, in
+  `list_tasks/1`'s case, writes nothing at all. Before `list_tasks/1`
+  existed, the service had no side-effect-free way to be queried, which
+  was patched around informally more than once and caused a real
+  incident: a `get_next_task` call used purely as a reachability probe
+  claimed and locked an unrelated live task.
   """
 
   import Ecto.Query, warn: false
@@ -22,6 +33,23 @@ defmodule LetflowQueue.Tasks do
   alias LetflowQueue.Tasks.Task
 
   @type task :: Task.t()
+
+  # The eligibility predicate: a task is claimable when it is `"open"`,
+  # unlocked, and every id in its `depends_on` list belongs to a task with
+  # `status = "done"`. Interpolated verbatim into BOTH the atomic claim
+  # query in `get_next_task/1` below AND the read-only listing query in
+  # `list_tasks/1`, so the two can never independently drift — a second,
+  # separately-written predicate that drifts from the claim query is
+  # exactly the defect a read-only listing endpoint is most likely to
+  # ship. `t` is the query's required table alias in both call sites.
+  @eligibility_predicate_sql """
+  (t.status = 'open' AND t.locked_by IS NULL AND NOT EXISTS (
+    SELECT 1 FROM json_each(t.depends_on) dep
+    WHERE NOT EXISTS (
+      SELECT 1 FROM tasks dt WHERE dt.id = dep.value AND dt.status = 'done'
+    )
+  ))
+  """
 
   @doc """
   Creates a new task with an auto-incrementing `impl_order` (== `id`).
@@ -174,31 +202,13 @@ defmodule LetflowQueue.Tasks do
     WHERE id = COALESCE(
       (
         SELECT t.id FROM tasks t
-        WHERE t.status = 'open'
-          AND t.locked_by IS NULL
-          AND t.task_type = 'issue'
-          AND NOT EXISTS (
-            SELECT 1 FROM json_each(t.depends_on) dep
-            WHERE NOT EXISTS (
-              SELECT 1 FROM tasks dt
-              WHERE dt.id = dep.value AND dt.status = 'done'
-            )
-          )
+        WHERE t.task_type = 'issue' AND #{@eligibility_predicate_sql}
         ORDER BY t.id DESC
         LIMIT 1
       ),
       (
         SELECT t.id FROM tasks t
-        WHERE t.status = 'open'
-          AND t.locked_by IS NULL
-          AND t.task_type = 'requirement'
-          AND NOT EXISTS (
-            SELECT 1 FROM json_each(t.depends_on) dep
-            WHERE NOT EXISTS (
-              SELECT 1 FROM tasks dt
-              WHERE dt.id = dep.value AND dt.status = 'done'
-            )
-          )
+        WHERE t.task_type = 'requirement' AND #{@eligibility_predicate_sql}
         ORDER BY t.id ASC
         LIMIT 1
       )
@@ -278,6 +288,56 @@ defmodule LetflowQueue.Tasks do
     |> then(&Repo.load(Task, &1))
   end
 
+  # list_tasks/1's SELECT above returns @returning_columns plus one extra
+  # trailing `eligible` column (0/1) computed by the shared SQL predicate.
+  # Splits the row, loads the base columns through the same Ecto.Type
+  # loaders load_task/1 uses, then attaches the computed fields.
+  defp row_to_listed_task(row, done_ids) when is_list(row) do
+    {base_row, [eligible_flag]} = Enum.split(row, length(@returning_columns))
+    task = load_task(base_row)
+
+    Task.to_json_map(task)
+    |> Map.put(:blocked_by, Enum.reject(task.depends_on, &(&1 in done_ids)))
+    |> Map.put(:eligible, eligible_flag == 1)
+  end
+
+  defp done_task_ids do
+    Repo.all(from t in Task, where: t.status == "done", select: t.id)
+  end
+
+  # Accepts either string or atom filter keys (controllers hand in
+  # string-keyed conn params; callers from Elixir code may prefer atoms)
+  # and normalizes to strings so lookups below don't have to check both.
+  defp normalize_filter_keys(filters) do
+    Map.new(filters, fn
+      {key, value} when is_atom(key) -> {Atom.to_string(key), value}
+      {key, value} -> {key, value}
+    end)
+  end
+
+  defp apply_filters(tasks, filters) do
+    tasks
+    |> filter_eq(:status, Map.get(filters, "status"))
+    |> filter_eq(:task_type, Map.get(filters, "task_type"))
+    |> filter_eq(:stage, Map.get(filters, "stage"))
+    |> filter_eligible(Map.get(filters, "eligible"))
+  end
+
+  defp filter_eq(tasks, _field, nil), do: tasks
+  defp filter_eq(tasks, field, value), do: Enum.filter(tasks, &(Map.get(&1, field) == value))
+
+  defp filter_eligible(tasks, nil), do: tasks
+
+  defp filter_eligible(tasks, value) do
+    bool = cast_bool(value)
+    Enum.filter(tasks, &(&1.eligible == bool))
+  end
+
+  defp cast_bool(true), do: true
+  defp cast_bool(false), do: false
+  defp cast_bool("true"), do: true
+  defp cast_bool("false"), do: false
+
   @doc """
   Explicit manual (re-)lock of a task by id.
 
@@ -354,6 +414,57 @@ defmodule LetflowQueue.Tasks do
       true ->
         do_release_lock(id, agent_id, status, force)
     end
+  end
+
+  @doc """
+  Read-only listing of tasks, with optional combinable filters. Performs
+  **no write of any kind** — no lock, no status transition, and
+  specifically it never calls `import_open_github_issues/0` (the
+  best-effort GitHub sync step `get_next_task/1` runs first, which
+  inserts rows) — a "read-only" endpoint that imports would not be
+  read-only. This is the single most important property of this
+  function; see the moduledoc's "one mutating claim path" note.
+
+  `filters` is a string-keyed map; every key is optional and absent means
+  no filtering on that dimension. All given filters combine (intersect,
+  not union):
+
+    * `"status"` — exact match on `status`.
+    * `"task_type"` — exact match on `task_type`.
+    * `"stage"` — exact match on `stage`.
+    * `"eligible"` — boolean (or `"true"`/`"false"` string) match on the
+      computed `eligible` field described below.
+
+  Each returned task is a plain map carrying every field
+  `Task.to_json_map/1` returns, plus two computed fields:
+
+    * `:blocked_by` — the subset of `depends_on` whose tasks are not
+      `status: "done"`. `[]` when every dependency is satisfied.
+    * `:eligible` — `true` iff `status == "open"` AND `locked_by IS NIL`
+      AND `blocked_by == []` — i.e. iff `get_next_task/1`'s atomic claim
+      query would currently consider this task a candidate. Computed via
+      the literal SQL fragment shared with that query
+      (`@eligibility_predicate_sql`) so the two can never independently
+      drift.
+  """
+  @spec list_tasks(map()) :: [map()]
+  def list_tasks(filters \\ %{}) when is_map(filters) do
+    query = """
+    SELECT id, title, description, acceptance_criteria, depends_on,
+      stage, task_type, status, locked_by, locked_at, github_issue_number,
+      body, inserted_at, updated_at,
+      CASE WHEN #{@eligibility_predicate_sql} THEN 1 ELSE 0 END AS eligible
+    FROM tasks t
+    ORDER BY t.id ASC
+    """
+
+    %{rows: rows} = Ecto.Adapters.SQL.query!(Repo, query, [])
+
+    done_ids = done_task_ids()
+
+    rows
+    |> Enum.map(&row_to_listed_task(&1, done_ids))
+    |> apply_filters(normalize_filter_keys(filters))
   end
 
   defp do_release_lock(id, agent_id, status, force) do

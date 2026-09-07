@@ -4,6 +4,17 @@ defmodule LetflowQueueWeb.TaskController do
   alias LetflowQueue.Tasks
   alias LetflowQueue.Tasks.Task
 
+  # GET /tasks?status=&task_type=&stage=&eligible=
+  #
+  # Read-only listing — see LetflowQueue.Tasks.list_tasks/1. Unlike every
+  # other endpoint in this controller, the response is not the
+  # {"data":, "error":} envelope: it's a plain {"tasks": [...]} list,
+  # since there's no single-resource success/error split to represent.
+  def index(conn, params) do
+    tasks = Tasks.list_tasks(params)
+    json(conn, %{"tasks" => tasks})
+  end
+
   # POST /tasks
   def register(conn, params) do
     case Tasks.register_task(params) do

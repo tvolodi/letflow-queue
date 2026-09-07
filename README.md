@@ -13,26 +13,36 @@ services to run).
 
 ## Design
 
-The task queue itself has exactly **four** externally-callable
-operations. This is deliberate: an AI agent driving this service can
-register a task, claim the next eligible one, and lock/release —
-nothing else. There is no generic CRUD, no way to list/edit/delete
-tasks outside that lock protocol, and no way to bypass the atomic-claim
-semantics. (A separate, small key-management surface — "Client API
-keys" below — exists alongside this for auth administration; it isn't
-part of the four.)
+The task queue's core invariant is not a fixed operation count — it is
+that there is exactly **ONE mutating claim path**: `get_next_task`'s
+atomic `UPDATE ... RETURNING` is the only place a task can be claimed,
+and no other operation can bypass or race it. Everything else either
+performs a write the caller explicitly asked for (register/lock/
+release) or, for `list_tasks`, performs no write at all. (A separate,
+small key-management surface — "Client API keys" below — exists
+alongside this for auth administration.)
 
 1. **register_task** — create a new task.
 2. **get_next_task** — atomically claim the single next eligible task
    (`status = "open"`, unlocked, all dependencies `"done"`). Two-tier
    priority: the **newest** eligible `task_type: "issue"` task if one
    exists, else the **lowest-`impl_order`** eligible `task_type:
-   "requirement"` task.
+   "requirement"` task. **This is the one mutating claim path** —
+   every other operation either performs a different, explicitly
+   requested write, or (list_tasks) none at all.
 3. **set_lock** — explicit manual (re-)lock of a task you already know
    the id of (e.g. re-acquiring your own lock after a crash).
 4. **release_lock** — release a lock, optionally transitioning status,
    with an admin/ORCH `force` override to unstick a task if a host died
    mid-work.
+5. **list_tasks** — **read-only**: lists tasks with optional filters
+   and computed eligibility. Performs no write of any kind — no lock,
+   no status transition, and it specifically never runs the GitHub
+   import step `get_next_task` runs first. This exists because before
+   it did, the service had no side-effect-free way to be queried at
+   all, which was patched around informally more than once and caused
+   a real incident: a `get_next_task` call used purely as a
+   reachability probe claimed and locked an unrelated live task.
 
 Every task row: `id` (= `impl_order`, autoincrement primary key),
 `title`, `description`, `acceptance_criteria` (JSON list of strings),
@@ -89,8 +99,9 @@ is a genuine cross-reference to another issue and is left verbatim.
 
 ## GitHub Issues sync
 
-The four operations above remain the only *control* surface — agents
-never read or write GitHub Issues to drive the queue. Separately, this
+The operations above remain the only *control* surface — agents
+never read or write GitHub Issues to drive the queue, and `list_tasks`
+never triggers this sync (see "GET /tasks" below). Separately, this
 service optionally mirrors queue state into GitHub's own UI for human
 visibility, in both directions:
 
@@ -215,13 +226,74 @@ mint it, the same convention already used for `QUEUE_AUTH_TOKEN` itself.
 ## Response envelope
 
 Every endpoint returns `{"data": ..., "error": ...}` — exactly one of
-the two is non-null. The one deviation is `GET /health`, which returns
-the minimal `{"status":"ok"}` shape instead, since it's consumed by
-generic infra tooling (Docker `HEALTHCHECK`, compose, uptime probes)
-that expects that exact minimal body rather than the app's own
-envelope.
+the two is non-null. There are two deviations: `GET /health`, which
+returns the minimal `{"status":"ok"}` shape instead, since it's
+consumed by generic infra tooling (Docker `HEALTHCHECK`, compose,
+uptime probes) that expects that exact minimal body rather than the
+app's own envelope; and `GET /tasks`, which returns `{"tasks": [...]}`
+since a listing has no single-resource success/error split to
+represent.
 
 ## Endpoints
+
+### `GET /tasks` — list_tasks (read-only)
+
+Lists tasks. Performs **no write of any kind** — no lock, no status
+transition, and it never runs the GitHub-issue-import step
+`get_next_task` runs first. Use this to inspect queue state (a
+reachability probe, a dashboard, a "what's next" preview) without any
+risk of claiming or mutating a live task — the incident this endpoint
+exists to prevent was exactly that: a `get_next_task` call used purely
+as a probe locked an unrelated real task.
+
+```bash
+curl "http://localhost:4000/tasks?status=open&eligible=true" \
+  -H "Authorization: Bearer $QUEUE_AUTH_TOKEN"
+```
+
+Optional query filters, all combinable (intersect, not union), absent
+= no filtering: `status`, `task_type`, `stage`, `eligible` (`true`/
+`false`).
+
+Response (`200`):
+
+```json
+{
+  "tasks": [
+    {
+      "id": 42,
+      "impl_order": 42,
+      "issue_ref": null,
+      "title": "Implement REQ-042",
+      "description": "Add the foo endpoint per docs/requirements.yaml",
+      "acceptance_criteria": ["mix test passes"],
+      "depends_on": [12, 13],
+      "stage": "S2",
+      "task_type": "requirement",
+      "status": "open",
+      "locked_by": null,
+      "locked_at": null,
+      "github_issue_number": null,
+      "body": null,
+      "blocked_by": [13],
+      "eligible": false,
+      "inserted_at": "2026-08-15T00:00:00Z",
+      "updated_at": "2026-08-15T00:00:00Z"
+    }
+  ]
+}
+```
+
+Each task carries every field the other endpoints return, plus two
+computed fields:
+
+  * `blocked_by` — the subset of `depends_on` whose tasks are not
+    `status: "done"`. `[]` when every dependency is satisfied.
+  * `eligible` — `true` iff `status == "open"` AND `locked_by` is null
+    AND `blocked_by == []` — i.e. iff `get_next_task` would currently
+    consider this task a claim candidate. Computed from the exact same
+    SQL predicate `get_next_task`'s atomic claim query uses, so the two
+    can never independently drift.
 
 ### `POST /tasks` — register_task
 
@@ -383,10 +455,13 @@ mix test
 ```
 
 This includes `test/letflow_queue/tasks_test.exs`, which exercises all
-four context functions directly (not just over HTTP) — including a
+context functions directly (not just over HTTP) — including a
 concurrency test that spawns two (and, separately, ten) simultaneous
 `get_next_task/1` callers against the same eligible row and asserts
-exactly one receives it. There's also an HTTP-level test suite in
+exactly one receives it, and a `list_tasks/1` suite covering the
+zero-writes guarantee, computed `blocked_by`/`eligible`, filters, and a
+live cross-check that `eligible` agrees with what `get_next_task/1`
+actually claims. There's also an HTTP-level test suite in
 `test/letflow_queue_web/controllers/task_controller_test.exs` covering
 auth, status codes, and the response envelope.
 
