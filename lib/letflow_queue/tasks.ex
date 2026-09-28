@@ -234,12 +234,13 @@ defmodule LetflowQueue.Tasks do
 
   # Best-effort import step run before the atomic claim query. Never raises
   # and never affects the claim below: a GitHub failure here just means the
-  # import is skipped for this call, and the existing claim query proceeds
-  # exactly as it did before this feature existed.
+  # import/reconciliation is skipped for this call, and the existing claim
+  # query proceeds exactly as it did before this feature existed.
   defp import_open_github_issues do
     case GitHub.list_open_issues() do
       {:ok, issues} ->
         Enum.each(issues, &import_github_issue/1)
+        sync_stale_closed_tasks(issues)
 
       {:error, reason} ->
         Logger.warning(
@@ -247,6 +248,56 @@ defmodule LetflowQueue.Tasks do
             "proceeding without import for this call"
         )
     end
+  end
+
+  # Reconciliation half of the sync, added for tvolodi/letflow ISS-0285.
+  #
+  # import_github_issue/1 above only ever ADDS a task for a github_issue_number
+  # this service does not yet track. It never revisits a number it already
+  # tracks, so a task whose linked GitHub issue was closed by any path other
+  # than this service's own release_lock/2 -- a human closing it by hand, or
+  # (the common real-world case) the underlying defect getting fixed and the
+  # Letflow-side docs/issues/*.yaml record flipping to resolved without the
+  # queue task ever being released -- stayed status "open" here forever.
+  # get_next_task would then keep handing the exact same already-resolved
+  # task back out on every call, indistinguishable from a real eligible task.
+  #
+  # `open_issues` is the same list `list_open_issues/0` just returned, so this
+  # costs no extra GitHub API call. Any currently-open, unlocked, GitHub-linked
+  # task whose number is NOT in that list has had its issue closed elsewhere;
+  # it is transitioned to "done" here, the same terminal status a normal
+  # release_lock(status: "done") would have produced. Locked tasks are
+  # deliberately left alone -- a task with an active worker must not be
+  # silently flipped to "done" out from under whoever is holding it; the
+  # normal release_lock path handles those once the worker finishes.
+  @spec sync_stale_closed_tasks([%{number: pos_integer()}]) :: :ok
+  defp sync_stale_closed_tasks(open_issues) do
+    open_numbers = MapSet.new(open_issues, & &1.number)
+
+    from(t in Task,
+      where: t.status == "open" and is_nil(t.locked_by) and not is_nil(t.github_issue_number)
+    )
+    |> Repo.all()
+    |> Enum.each(fn task ->
+      if not MapSet.member?(open_numbers, task.github_issue_number) do
+        task
+        |> Ecto.Changeset.change(status: "done")
+        |> Repo.update()
+        |> case do
+          {:ok, _updated} ->
+            :ok
+
+          {:error, changeset} ->
+            Logger.warning(
+              "letflow-queue: failed to mark task #{task.id} done after its linked " <>
+                "GitHub issue ##{task.github_issue_number} was found closed: " <>
+                inspect(changeset.errors)
+            )
+        end
+      end
+    end)
+
+    :ok
   end
 
   defp import_github_issue(%{number: number, title: title, body: body}) do
