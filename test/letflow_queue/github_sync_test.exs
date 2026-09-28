@@ -199,6 +199,74 @@ defmodule LetflowQueue.GithubSyncTest do
     end
   end
 
+  describe "get_next_task/1 stale-closed-issue reconciliation (ISS-0285)" do
+    # Regression coverage for tvolodi/letflow ISS-0285: a task whose linked
+    # GitHub issue was closed by some means OTHER than this service's own
+    # release_lock/2 (e.g. the underlying defect was fixed and the Letflow
+    # side's docs/issues/*.yaml record flipped to resolved, but the queue
+    # task itself was never released) must stop being returned as claimable.
+    # import_open_github_issues/0 only ever *added* new tasks for
+    # not-yet-tracked issue numbers; it never looked at what happened to a
+    # number it already tracks. A task's local `status` could therefore
+    # drift out of sync with reality indefinitely, and get_next_task would
+    # hand the exact same already-resolved task back out forever.
+    @issue_attrs %{
+      "title" => "Something broke",
+      "description" => "and here is the diagnosis",
+      "acceptance_criteria" => ["See linked GitHub issue for full description"],
+      "task_type" => "issue"
+    }
+
+    test "a tracked open task whose GitHub issue is no longer open is not returned, and is marked done" do
+      # Task 500 is tracked locally (adopted github_issue_number, never
+      # released) but its GitHub issue is no longer among the repo's open
+      # issues -- i.e. it was closed by some path this service didn't drive.
+      assert {:ok, task} =
+               Tasks.register_task(Map.put(@issue_attrs, "github_issue_number", 500))
+
+      assert task.status == "open"
+
+      FakeClient.set_list_open_issues_result({:ok, []})
+
+      assert Tasks.get_next_task("agent-1") == {:error, :no_eligible_task}
+
+      reloaded = LetflowQueue.Repo.get!(LetflowQueue.Tasks.Task, task.id)
+      assert reloaded.status == "done"
+      assert reloaded.locked_by == nil
+    end
+
+    test "a tracked open task whose GitHub issue is still open is unaffected" do
+      assert {:ok, task} =
+               Tasks.register_task(Map.put(@issue_attrs, "github_issue_number", 501))
+
+      FakeClient.set_list_open_issues_result(
+        {:ok, [%{number: 501, title: "Something broke", body: "still broken"}]}
+      )
+
+      assert {:ok, claimed} = Tasks.get_next_task("agent-1")
+      assert claimed.id == task.id
+      assert claimed.status == "open"
+      assert claimed.locked_by == "agent-1"
+    end
+
+    test "a task already locked by an active worker is left alone even if the issue closed underneath it" do
+      assert {:ok, task} =
+               Tasks.register_task(Map.put(@issue_attrs, "github_issue_number", 502))
+
+      assert {:ok, _} = Tasks.set_lock(task.id, "agent-1")
+
+      FakeClient.set_list_open_issues_result({:ok, []})
+
+      # Nothing else eligible, and the locked task must not be silently
+      # flipped to "done" out from under whoever is holding it.
+      assert Tasks.get_next_task("agent-2") == {:error, :no_eligible_task}
+
+      reloaded = LetflowQueue.Repo.get!(LetflowQueue.Tasks.Task, task.id)
+      assert reloaded.status == "open"
+      assert reloaded.locked_by == "agent-1"
+    end
+  end
+
   describe "release_lock/2 GitHub issue closing" do
     test "calls the GitHub client to close the issue when status: done and github_issue_number is set" do
       FakeClient.set_create_issue_result({:ok, 999})
