@@ -297,12 +297,24 @@ defmodule LetflowQueue.Tasks do
     task = load_task(base_row)
 
     Task.to_json_map(task)
-    |> Map.put(:blocked_by, Enum.reject(task.depends_on, &(&1 in done_ids)))
+    |> Map.put(:blocked_by, unmet_dependency_ids(task, done_ids))
     |> Map.put(:eligible, eligible_flag == 1)
   end
 
   defp done_task_ids do
     Repo.all(from t in Task, where: t.status == "done", select: t.id)
+  end
+
+  # The subset of `task.depends_on` not present in `done_ids` — i.e. the
+  # dependency ids still blocking this task. Extracted from
+  # `row_to_listed_task/2`'s original inline expression (REQ-222) so
+  # `set_lock/2`'s eligibility check (REQ-223) can reuse the exact same
+  # semantics against an already-loaded `%Task{}` struct, rather than
+  # writing a third, independently-drifting copy of this logic. Behavior
+  # here is unchanged from the original inline `Enum.reject`.
+  @spec unmet_dependency_ids(Task.t(), [integer()]) :: [integer()]
+  defp unmet_dependency_ids(%Task{} = task, done_ids) when is_list(done_ids) do
+    Enum.reject(task.depends_on, &(&1 in done_ids))
   end
 
   # Accepts either string or atom filter keys (controllers hand in
@@ -341,14 +353,34 @@ defmodule LetflowQueue.Tasks do
   @doc """
   Explicit manual (re-)lock of a task by id.
 
-    * If the task is unlocked, or already locked by the same `agent_id`,
-      the lock is set/refreshed and `{:ok, task}` is returned.
-    * If the task is locked by a *different* agent_id, returns
-      `{:error, :locked_by_other}`.
-    * If the task doesn't exist, returns `{:error, :not_found}`.
+  Checked, strictly in this order, against the loaded task and the
+  caller's `agent_id`:
+
+    1. **Same-agent recovery** — if the task is already locked by this
+       same `agent_id`, the lock is set/refreshed and `{:ok, task}` is
+       returned unconditionally — this branch is not gated on
+       eligibility at all (e.g. reacquiring your own lock after a crash,
+       even if the task's status changed to non-`"open"` in the
+       meantime).
+    2. **Locked by a different agent** — else, if the task is locked by
+       any other `agent_id`, returns `{:error, :locked_by_other}`. This
+       is checked *before* eligibility, so a task that is both
+       locked-by-another and ineligible still reports this reason.
+    3. **Eligibility** — else (the task is unlocked), the task must be
+       `status: "open"` and have no unmet `depends_on` ids (the same
+       predicate `get_next_task/1` and `list_tasks/1` use). If not,
+       returns `{:error, :not_eligible, unmet_dependency_ids}`, where
+       `unmet_dependency_ids` is the list of `depends_on` ids not yet
+       `"done"` (possibly `[]`, when the sole cause of ineligibility is
+       non-`"open"` status).
+
+  If the task doesn't exist, returns `{:error, :not_found}`.
   """
   @spec set_lock(integer(), String.t()) ::
-          {:ok, Task.t()} | {:error, :locked_by_other} | {:error, :not_found}
+          {:ok, Task.t()}
+          | {:error, :locked_by_other}
+          | {:error, :not_eligible, [integer()]}
+          | {:error, :not_found}
   def set_lock(id, agent_id) when is_binary(agent_id) and agent_id != "" do
     now = DateTime.utc_now() |> DateTime.truncate(:second)
 
@@ -361,13 +393,24 @@ defmodule LetflowQueue.Tasks do
     end)
     |> Multi.run(:locked, fn repo, %{task: task} ->
       cond do
-        is_nil(task.locked_by) or task.locked_by == agent_id ->
+        task.locked_by == agent_id ->
           task
           |> Ecto.Changeset.change(locked_by: agent_id, locked_at: now)
           |> repo.update()
 
-        true ->
+        not is_nil(task.locked_by) ->
           {:error, :locked_by_other}
+
+        true ->
+          unmet_ids = unmet_dependency_ids(task, done_task_ids())
+
+          if task.status == "open" and unmet_ids == [] do
+            task
+            |> Ecto.Changeset.change(locked_by: agent_id, locked_at: now)
+            |> repo.update()
+          else
+            {:error, {:not_eligible, unmet_ids}}
+          end
       end
     end)
     |> Repo.transaction()
@@ -375,6 +418,7 @@ defmodule LetflowQueue.Tasks do
       {:ok, %{locked: task}} -> {:ok, task}
       {:error, :task, :not_found, _} -> {:error, :not_found}
       {:error, :locked, :locked_by_other, _} -> {:error, :locked_by_other}
+      {:error, :locked, {:not_eligible, unmet_ids}, _} -> {:error, :not_eligible, unmet_ids}
     end
   end
 

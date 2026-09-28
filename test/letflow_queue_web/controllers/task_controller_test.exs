@@ -146,6 +146,71 @@ defmodule LetflowQueueWeb.TaskControllerTest do
 
       assert json_response(conn, 404)
     end
+
+    test "409s :not_eligible with unmet_dependency_ids in the body when a depends_on is unmet",
+         %{conn: conn} do
+      {:ok, dep} = Tasks.register_task(@valid_attrs)
+      {:ok, gated} = Tasks.register_task(Map.put(@valid_attrs, "depends_on", [dep.id]))
+
+      conn =
+        conn |> authed() |> post(~p"/tasks/#{gated.id}/lock", %{"agent_id" => "agent-1"})
+
+      body = json_response(conn, 409)
+      assert body["data"] == nil
+      assert body["error"] == "task is not eligible to be locked"
+      assert body["unmet_dependency_ids"] == [dep.id]
+      assert is_list(body["unmet_dependency_ids"])
+      assert Enum.all?(body["unmet_dependency_ids"], &is_integer/1)
+    end
+
+    test "409s :not_eligible with an empty unmet_dependency_ids list for a non-open status",
+         %{conn: conn} do
+      {:ok, task} = Tasks.register_task(@valid_attrs)
+      {:ok, _} = Tasks.release_lock(task.id, force: true, status: "done")
+
+      conn =
+        conn |> authed() |> post(~p"/tasks/#{task.id}/lock", %{"agent_id" => "agent-1"})
+
+      body = json_response(conn, 409)
+      assert body["error"] == "task is not eligible to be locked"
+      assert body["unmet_dependency_ids"] == []
+    end
+
+    test "locked-by-other takes precedence over :not_eligible at the HTTP layer too",
+         %{conn: conn} do
+      {:ok, dep} = Tasks.register_task(@valid_attrs)
+      {:ok, gated} = Tasks.register_task(Map.put(@valid_attrs, "depends_on", [dep.id]))
+
+      # gated is ineligible (unmet depends_on), so Tasks.set_lock/2 itself
+      # would refuse to lock it -- force the lock directly to reach the
+      # locked-by-other-AND-ineligible state under test.
+      {:ok, _} =
+        gated
+        |> Ecto.Changeset.change(
+          locked_by: "agent-other",
+          locked_at: DateTime.utc_now() |> DateTime.truncate(:second)
+        )
+        |> LetflowQueue.Repo.update()
+
+      conn =
+        conn |> authed() |> post(~p"/tasks/#{gated.id}/lock", %{"agent_id" => "agent-1"})
+
+      body = json_response(conn, 409)
+      assert body["error"] == "task is locked by a different agent"
+      refute Map.has_key?(body, "unmet_dependency_ids")
+    end
+
+    test "same-agent recovery still returns 200 through the controller when otherwise eligible",
+         %{conn: conn} do
+      {:ok, task} = Tasks.register_task(@valid_attrs)
+      {:ok, _} = Tasks.set_lock(task.id, "agent-1")
+
+      conn =
+        conn |> authed() |> post(~p"/tasks/#{task.id}/lock", %{"agent_id" => "agent-1"})
+
+      assert %{"data" => data, "error" => nil} = json_response(conn, 200)
+      assert data["locked_by"] == "agent-1"
+    end
   end
 
   describe "POST /tasks/:id/release (release_lock)" do

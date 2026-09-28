@@ -63,6 +63,15 @@ defmodule LetflowQueueWeb.TaskController do
             |> put_status(:conflict)
             |> json(%{data: nil, error: "task is locked by a different agent"})
 
+          {:error, :not_eligible, unmet_dependency_ids} ->
+            conn
+            |> put_status(:conflict)
+            |> json(%{
+              data: nil,
+              error: "task is not eligible to be locked",
+              unmet_dependency_ids: unmet_dependency_ids
+            })
+
           {:error, :not_found} ->
             conn
             |> put_status(:not_found)
