@@ -389,9 +389,24 @@ curl -X POST http://localhost:4000/tasks/42/lock \
 ```
 
 - Unlocked, or already locked by the same `agent_id` → `200`, lock
-  set/refreshed (re-locking with the same `agent_id` is idempotent).
+  set/refreshed (re-locking with the same `agent_id` is idempotent, and
+  is **not** gated on eligibility — recovering your own lock always
+  succeeds, even if the task's status has since changed to non-`"open"`).
 - Locked by a *different* `agent_id` → `409 Conflict`.
+- Open, unlocked, but not eligible (an unmet `depends_on` id, or
+  `status` is not `"open"`) → `409 Conflict`, body includes
+  `unmet_dependency_ids` (empty if the only problem is non-open status).
 - Unknown task id → `404`.
+
+If a task is both locked by a different agent and ineligible, the
+lock-conflict error (`409`, `"task is locked by a different agent"`) is
+returned, not the eligibility error.
+
+Not eligible (`409`):
+
+```json
+{ "data": null, "error": "task is not eligible to be locked", "unmet_dependency_ids": [12, 14] }
+```
 
 ### `POST /tasks/:id/release` — release_lock
 
