@@ -288,6 +288,117 @@ defmodule LetflowQueue.TasksTest do
     end
   end
 
+  describe "set_lock/2 eligibility gating (REQ-223)" do
+    test "an open, unlocked task with an unmet depends_on is rejected :not_eligible with the unmet ids" do
+      assert {:ok, dep} = Tasks.register_task(@valid_attrs)
+
+      assert {:ok, gated} =
+               Tasks.register_task(Map.put(@valid_attrs, "depends_on", [dep.id]))
+
+      assert {:error, :not_eligible, [dep.id]} == Tasks.set_lock(gated.id, "agent-1")
+
+      # and the task must remain unlocked -- rejection must not grant the lock
+      assert {:ok, reloaded} = Tasks.get_next_task("agent-2")
+      assert reloaded.id == dep.id
+    end
+
+    test "a task with multiple depends_on reports every still-unmet id, not just one" do
+      assert {:ok, dep1} = Tasks.register_task(@valid_attrs)
+      assert {:ok, dep2} = Tasks.register_task(@valid_attrs)
+
+      assert {:ok, gated} =
+               Tasks.register_task(Map.put(@valid_attrs, "depends_on", [dep1.id, dep2.id]))
+
+      assert {:error, :not_eligible, unmet} = Tasks.set_lock(gated.id, "agent-1")
+      assert Enum.sort(unmet) == Enum.sort([dep1.id, dep2.id])
+    end
+
+    test "status done is rejected :not_eligible even with no depends_on" do
+      assert {:ok, task} = Tasks.register_task(@valid_attrs)
+      assert {:ok, _} = Tasks.release_lock(task.id, force: true, status: "done")
+
+      assert {:error, :not_eligible, []} = Tasks.set_lock(task.id, "agent-1")
+    end
+
+    test "status blocked is rejected :not_eligible even with no depends_on" do
+      assert {:ok, task} = Tasks.register_task(@valid_attrs)
+      assert {:ok, _} = Tasks.release_lock(task.id, force: true, status: "blocked")
+
+      assert {:error, :not_eligible, []} = Tasks.set_lock(task.id, "agent-1")
+    end
+
+    test "locked by a different agent AND ineligible still reports :locked_by_other, not :not_eligible" do
+      assert {:ok, dep} = Tasks.register_task(@valid_attrs)
+
+      assert {:ok, gated} =
+               Tasks.register_task(Map.put(@valid_attrs, "depends_on", [dep.id]))
+
+      # Force-lock the (still-ineligible) gated task by a different agent,
+      # bypassing set_lock's own gating, to put it in the
+      # locked-by-other-AND-ineligible state under test.
+      assert {:ok, _} =
+               gated
+               |> Ecto.Changeset.change(
+                 locked_by: "agent-other",
+                 locked_at: DateTime.utc_now() |> DateTime.truncate(:second)
+               )
+               |> Repo.update()
+
+      assert {:error, :locked_by_other} = Tasks.set_lock(gated.id, "agent-1")
+    end
+
+    test "same-agent recovery succeeds unaffected by eligibility, even after status changed to non-open" do
+      assert {:ok, task} = Tasks.register_task(@valid_attrs)
+      assert {:ok, _} = Tasks.set_lock(task.id, "agent-1")
+
+      # Flip status away from "open" without releasing the lock -- this
+      # would make the task ineligible if eligibility were checked, but
+      # the same-agent branch must short-circuit before that check.
+      assert {:ok, _} =
+               task
+               |> Ecto.Changeset.change(status: "blocked")
+               |> Repo.update()
+
+      assert {:ok, relocked} = Tasks.set_lock(task.id, "agent-1")
+      assert relocked.locked_by == "agent-1"
+      assert relocked.status == "blocked"
+    end
+
+    test "same-agent recovery still succeeds when otherwise eligible (no behavior regression)" do
+      assert {:ok, task} = Tasks.register_task(@valid_attrs)
+      assert {:ok, _} = Tasks.set_lock(task.id, "agent-1")
+
+      assert {:ok, relocked} = Tasks.set_lock(task.id, "agent-1")
+      assert relocked.locked_by == "agent-1"
+    end
+
+    test "eligible: false via list_tasks (unmet dependency) and set_lock's :not_eligible agree on the reason" do
+      assert {:ok, dep} = Tasks.register_task(@valid_attrs)
+
+      assert {:ok, gated} =
+               Tasks.register_task(Map.put(@valid_attrs, "depends_on", [dep.id]))
+
+      listed = Tasks.list_tasks() |> Enum.find(&(&1.id == gated.id))
+      assert listed.eligible == false
+      assert listed.blocked_by == [dep.id]
+
+      assert {:error, :not_eligible, unmet} = Tasks.set_lock(gated.id, "agent-1")
+      assert unmet == listed.blocked_by
+    end
+
+    test "eligible: false via list_tasks (bad status, no unmet deps) and set_lock's :not_eligible agree on the reason" do
+      assert {:ok, task} = Tasks.register_task(@valid_attrs)
+      assert {:ok, _} = Tasks.release_lock(task.id, force: true, status: "done")
+
+      listed = Tasks.list_tasks() |> Enum.find(&(&1.id == task.id))
+      assert listed.eligible == false
+      assert listed.blocked_by == []
+
+      assert {:error, :not_eligible, unmet} = Tasks.set_lock(task.id, "agent-1")
+      assert unmet == listed.blocked_by
+    end
+  end
+
   describe "release_lock/2" do
     test "the holding agent releases its lock, leaving status open when status omitted" do
       assert {:ok, task} = Tasks.register_task(@valid_attrs)
